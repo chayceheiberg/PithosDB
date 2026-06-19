@@ -27,14 +27,18 @@ public sealed class SSTableWriter
     /// <param name="entries">
     /// Sorted key-value pairs to write. A <see langword="null"/> value encodes a tombstone.
     /// </param>
-    public static void Write(string path, IEnumerable<KeyValuePair<byte[], byte[]?>> entries)
+    /// <param name="bloomFalsePositiveRate">
+    /// Target false positive rate for the bloom filter. Defaults to 1%.
+    /// </param>
+    public static void Write(string path, IEnumerable<KeyValuePair<byte[], byte[]?>> entries,
+        double bloomFalsePositiveRate = 0.01)
     {
         var entryList = entries.ToList();
 
         using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write);
         using var writer = new BinaryWriter(stream);
 
-        var bloom = new BloomFilter(Math.Max(1, entryList.Count));
+        var bloom = new BloomFilter(Math.Max(1, entryList.Count), bloomFalsePositiveRate);
         foreach (var (key, _) in entryList)
             bloom.Add(key);
 

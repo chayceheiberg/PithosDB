@@ -12,9 +12,8 @@ namespace Pithos.Core;
 /// </summary>
 public sealed class PithosDb : IDisposable
 {
-    private const long MemTableSizeThreshold = 4 * 1024 * 1024; // 4 MB
-
     private readonly string _directory;
+    private readonly PithosOptions _options;
     private readonly LeveledCompactor _compactor;
     private readonly List<List<string>> _levels = [];
     private readonly Lock _writeLock = new();
@@ -27,14 +26,17 @@ public sealed class PithosDb : IDisposable
     /// WAL entries are replayed and existing SSTable files are recovered into the
     /// level structure before the instance is returned.
     /// </summary>
-    /// <param name="directory">
-    /// Path to the database directory. Created if it does not exist.
+    /// <param name="directory">Path to the database directory. Created if it does not exist.</param>
+    /// <param name="options">
+    /// Tuning options. Pass <see langword="null"/> or omit to use <see cref="PithosOptions.Default"/>.
     /// </param>
-    public PithosDb(string directory)
+    public PithosDb(string directory, PithosOptions? options = null)
     {
+        _options = options ?? PithosOptions.Default;
+        _options.Validate();
         _directory = directory;
         Directory.CreateDirectory(directory);
-        _compactor = new LeveledCompactor(directory);
+        _compactor = new LeveledCompactor(directory, _options);
         _wal = new WriteAheadLog(Path.Combine(directory, "wal.log"));
         RecoverFromWal();
         RecoverSSTables();
@@ -44,7 +46,7 @@ public sealed class PithosDb : IDisposable
     /// Inserts or updates <paramref name="key"/> with <paramref name="value"/>.
     /// The write is appended to the WAL before being applied to the MemTable.
     /// A MemTable flush (and possible compaction) is triggered when the buffer
-    /// exceeds 4 MB.
+    /// exceeds <see cref="PithosOptions.MemTableSizeThreshold"/>.
     /// </summary>
     public void Put(byte[] key, byte[] value)
     {
@@ -106,12 +108,12 @@ public sealed class PithosDb : IDisposable
 
     private void MaybeFlushMemTable()
     {
-        if (_memTable.SizeBytes < MemTableSizeThreshold) return;
+        if (_memTable.SizeBytes < _options.MemTableSizeThreshold) return;
 
         if (_levels.Count == 0) _levels.Add([]);
 
         string sstPath = Path.Combine(_directory, $"L0_{Guid.NewGuid():N}.sst");
-        SSTableWriter.Write(sstPath, _memTable.GetSortedEntries());
+        SSTableWriter.Write(sstPath, _memTable.GetSortedEntries(), _options.BloomFilterFalsePositiveRate);
         _levels[0].Add(sstPath);
         _memTable.Clear();
 
