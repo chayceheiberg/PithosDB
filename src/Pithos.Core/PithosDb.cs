@@ -8,7 +8,9 @@ namespace Pithos.Core;
 /// Embedded key-value store backed by an LSM-tree. Writes are buffered in a
 /// <see cref="MemTable"/>, durably recorded in a <see cref="WriteAheadLog"/>,
 /// and periodically flushed to immutable <see cref="SSTableWriter">SSTables</see>
-/// on disk. Writes are thread-safe; concurrent reads are safe without locking.
+/// on disk. All public operations are thread-safe: concurrent reads proceed in
+/// parallel; a write briefly blocks all readers while the MemTable and level
+/// list are updated.
 /// </summary>
 public sealed class PithosDb : IDisposable
 {
@@ -16,7 +18,7 @@ public sealed class PithosDb : IDisposable
     private readonly PithosOptions _options;
     private readonly LeveledCompactor _compactor;
     private readonly List<List<string>> _levels = [];
-    private readonly Lock _writeLock = new();
+    private readonly ReaderWriterLockSlim _lock = new();
 
     private MemTable _memTable = new();
     private WriteAheadLog _wal;
@@ -50,11 +52,16 @@ public sealed class PithosDb : IDisposable
     /// </summary>
     public void Put(byte[] key, byte[] value)
     {
-        lock (_writeLock)
+        _lock.EnterWriteLock();
+        try
         {
             _wal.AppendPut(key, value);
             _memTable.Put(key, value);
             MaybeFlushMemTable();
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
         }
     }
 
@@ -66,18 +73,24 @@ public sealed class PithosDb : IDisposable
     /// </summary>
     public void Delete(byte[] key)
     {
-        lock (_writeLock)
+        _lock.EnterWriteLock();
+        try
         {
             _wal.AppendDelete(key);
             _memTable.Delete(key);
             MaybeFlushMemTable();
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
         }
     }
 
     /// <summary>
     /// Looks up <paramref name="key"/>, searching the MemTable first, then each
     /// SSTable level from newest to oldest. Returns <see langword="false"/> if
-    /// the key does not exist or has been deleted.
+    /// the key does not exist or has been deleted. Multiple threads may call
+    /// <see cref="TryGet"/> concurrently.
     /// </summary>
     /// <param name="key">The key to look up.</param>
     /// <param name="value">
@@ -89,21 +102,29 @@ public sealed class PithosDb : IDisposable
     /// </returns>
     public bool TryGet(byte[] key, out byte[]? value)
     {
-        if (_memTable.TryGet(key, out value))
-            return value is not null;
-
-        foreach (var level in _levels)
+        _lock.EnterReadLock();
+        try
         {
-            foreach (var sstPath in Enumerable.Reverse(level))
-            {
-                using var reader = new SSTableReader(sstPath);
-                if (reader.TryGet(key, out value))
-                    return value is not null;
-            }
-        }
+            if (_memTable.TryGet(key, out value))
+                return value is not null;
 
-        value = null;
-        return false;
+            foreach (var level in _levels)
+            {
+                foreach (var sstPath in Enumerable.Reverse(level))
+                {
+                    using var reader = new SSTableReader(sstPath);
+                    if (reader.TryGet(key, out value))
+                        return value is not null;
+                }
+            }
+
+            value = null;
+            return false;
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
     }
 
     private void MaybeFlushMemTable()
@@ -147,6 +168,10 @@ public sealed class PithosDb : IDisposable
         }
     }
 
-    /// <summary>Flushes and closes the WAL.</summary>
-    public void Dispose() => _wal.Dispose();
+    /// <summary>Flushes and closes the WAL, then disposes the lock.</summary>
+    public void Dispose()
+    {
+        _wal.Dispose();
+        _lock.Dispose();
+    }
 }
