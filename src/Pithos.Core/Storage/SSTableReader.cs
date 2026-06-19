@@ -2,6 +2,12 @@ using Pithos.Core.Core;
 
 namespace Pithos.Core.Storage;
 
+/// <summary>
+/// Reads an immutable SSTable file written by <see cref="SSTableWriter"/>.
+/// On open, the sparse index and bloom filter are loaded into memory; data
+/// blocks remain on disk and are read on demand. Each instance holds an open
+/// file handle — dispose when done.
+/// </summary>
 public sealed class SSTableReader : IDisposable
 {
     private readonly FileStream _stream;
@@ -10,8 +16,13 @@ public sealed class SSTableReader : IDisposable
     private readonly BloomFilter _bloom;
     private readonly long _bloomOffset;
 
+    /// <summary>Absolute path to the SSTable file.</summary>
     public string Path { get; }
 
+    /// <summary>
+    /// Opens the SSTable at <paramref name="path"/> and loads its index and
+    /// bloom filter into memory.
+    /// </summary>
     public SSTableReader(string path)
     {
         Path = path;
@@ -20,6 +31,18 @@ public sealed class SSTableReader : IDisposable
         (_index, _bloom, _bloomOffset) = ReadMetadata();
     }
 
+    /// <summary>
+    /// Looks up <paramref name="key"/> in this SSTable. The bloom filter is
+    /// consulted first; a definite miss returns <see langword="false"/> without
+    /// any block I/O. Returns <see langword="true"/> for tombstones (with a
+    /// <see langword="null"/> <paramref name="value"/>), allowing callers to
+    /// distinguish "found a tombstone" from "not present".
+    /// </summary>
+    /// <param name="key">The key to look up.</param>
+    /// <param name="value">
+    /// The stored value on success, <see langword="null"/> for a tombstone,
+    /// or <see langword="null"/> when the method returns <see langword="false"/>.
+    /// </param>
     public bool TryGet(byte[] key, out byte[]? value)
     {
         value = null;
@@ -50,6 +73,10 @@ public sealed class SSTableReader : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Streams all entries in byte-lexicographic key order, including tombstones.
+    /// Used by <see cref="Compaction.LeveledCompactor"/> during compaction.
+    /// </summary>
     public IEnumerable<KeyValuePair<byte[], byte[]?>> ReadAllEntries()
     {
         if (_index.Count == 0) yield break;
@@ -75,6 +102,10 @@ public sealed class SSTableReader : IDisposable
         }
     }
 
+    /// <summary>
+    /// Binary-searches the sparse index for the last block whose first key is
+    /// ≤ <paramref name="key"/>. Returns -1 if the key precedes the first block.
+    /// </summary>
     private long FindBlockOffset(byte[] key)
     {
         int lo = 0, hi = _index.Count - 1, result = -1;
@@ -88,6 +119,10 @@ public sealed class SSTableReader : IDisposable
         return result < 0 ? -1 : _index[result].offset;
     }
 
+    /// <summary>
+    /// Reads the 16-byte footer to locate the bloom filter and index sections,
+    /// then deserializes both into memory.
+    /// </summary>
     private (List<(byte[] firstKey, long offset)> index, BloomFilter bloom, long bloomOffset) ReadMetadata()
     {
         // Footer layout (last 16 bytes): [bloomOffset (8)] [indexOffset (8)]
@@ -117,6 +152,7 @@ public sealed class SSTableReader : IDisposable
         return (index, bloom, bloomOffset);
     }
 
+    /// <inheritdoc/>
     public void Dispose()
     {
         _reader.Dispose();

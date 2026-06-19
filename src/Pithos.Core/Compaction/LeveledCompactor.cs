@@ -3,11 +3,22 @@ using Pithos.Core.Storage;
 
 namespace Pithos.Core.Compaction;
 
+/// <summary>
+/// Implements leveled compaction for the LSM-tree. The engine uses 7 levels
+/// whose file-count limits grow by 10× per level (L0 = 10, L1 = 100, …).
+/// When a level reaches its limit, all its SSTables are merged into a single
+/// SSTable at the next level, deduplicating keys so that newer writes win.
+/// </summary>
 public sealed class LeveledCompactor
 {
     private readonly string _directory;
     private readonly int[] _levelSizeLimits;
 
+    /// <summary>
+    /// Creates a compactor for the database at <paramref name="directory"/>.
+    /// </summary>
+    /// <param name="directory">Database directory where SSTable files are written.</param>
+    /// <param name="levels">Total number of levels to manage (default 7).</param>
     public LeveledCompactor(string directory, int levels = 7)
     {
         _directory = directory;
@@ -16,6 +27,10 @@ public sealed class LeveledCompactor
         for (int i = 0; i < levels; i++) { _levelSizeLimits[i] = size; size *= 10; }
     }
 
+    /// <summary>
+    /// Checks each level and triggers a compaction cascade for any level that has
+    /// reached its file-count limit. Called after every MemTable flush.
+    /// </summary>
     public void CompactIfNeeded(List<List<string>> levels)
     {
         for (int level = 0; level < levels.Count - 1; level++)
@@ -25,6 +40,11 @@ public sealed class LeveledCompactor
         }
     }
 
+    /// <summary>
+    /// Merges all SSTables at <paramref name="level"/> into a single SSTable at
+    /// <c>level + 1</c>, then deletes the source files. The output file is placed
+    /// in <c>_directory</c> with a name like <c>L{n+1}_{guid}.sst</c>.
+    /// </summary>
     private void Compact(List<List<string>> levels, int level)
     {
         while (levels.Count <= level + 1)
@@ -48,6 +68,13 @@ public sealed class LeveledCompactor
         }
     }
 
+    /// <summary>
+    /// Performs a k-way merge over <paramref name="readers"/> using a
+    /// <see cref="PriorityQueue{TElement,TPriority}"/> ordered by
+    /// <c>(key asc, readerIndex desc)</c>. For duplicate keys across readers,
+    /// the entry from the highest-indexed reader (i.e. the newest SSTable) is
+    /// emitted and all older copies are discarded.
+    /// </summary>
     private static IEnumerable<KeyValuePair<byte[], byte[]?>> MergeEntries(List<SSTableReader> readers)
     {
         var comparer = ByteArrayComparer.Instance;
