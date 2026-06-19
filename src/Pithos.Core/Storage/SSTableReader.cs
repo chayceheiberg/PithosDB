@@ -74,6 +74,44 @@ public sealed class SSTableReader : IDisposable
     }
 
     /// <summary>
+    /// Streams entries whose keys fall within [<paramref name="from"/>, <paramref name="to"/>]
+    /// in byte-lexicographic order, including tombstones. Pass <see langword="null"/> for either
+    /// bound to leave it open-ended. Uses the sparse index to skip to the first candidate block.
+    /// </summary>
+    public IEnumerable<KeyValuePair<byte[], byte[]?>> Scan(byte[]? from, byte[]? to)
+    {
+        if (_index.Count == 0) yield break;
+
+        // Find the block that could contain `from`. If from precedes all keys, start at block 0.
+        long startOffset = from == null ? _index[0].offset : FindBlockOffset(from);
+        if (startOffset < 0) startOffset = _index[0].offset;
+
+        var comparer = ByteArrayComparer.Instance;
+        _stream.Seek(startOffset, SeekOrigin.Begin);
+
+        while (_stream.Position < _bloomOffset)
+        {
+            int count = _reader.ReadInt32();
+            for (int i = 0; i < count; i++)
+            {
+                var keyLen = _reader.ReadInt32();
+                var key = _reader.ReadBytes(keyLen);
+                var isTombstone = _reader.ReadBoolean();
+                byte[]? value = null;
+                if (!isTombstone)
+                {
+                    var valLen = _reader.ReadInt32();
+                    value = _reader.ReadBytes(valLen);
+                }
+
+                if (from != null && comparer.Compare(key, from) < 0) continue;
+                if (to != null && comparer.Compare(key, to) > 0) yield break;
+                yield return new KeyValuePair<byte[], byte[]?>(key, value);
+            }
+        }
+    }
+
+    /// <summary>
     /// Streams all entries in byte-lexicographic key order, including tombstones.
     /// Used by <see cref="Compaction.LeveledCompactor"/> during compaction.
     /// </summary>

@@ -127,6 +127,90 @@ public sealed class PithosDb : IDisposable
         }
     }
 
+    /// <summary>
+    /// Returns all live (non-deleted) entries whose keys fall within
+    /// [<paramref name="from"/>, <paramref name="to"/>], in byte-lexicographic order.
+    /// Pass <see langword="null"/> for either bound to leave it open-ended.
+    /// Results reflect a consistent point-in-time snapshot taken at the moment of the call.
+    /// </summary>
+    /// <param name="from">Inclusive lower bound, or <see langword="null"/> for no lower bound.</param>
+    /// <param name="to">Inclusive upper bound, or <see langword="null"/> for no upper bound.</param>
+    public IEnumerable<KeyValuePair<byte[], byte[]>> Scan(byte[]? from = null, byte[]? to = null)
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            return ExecuteScan(from, to);
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+    }
+
+    private List<KeyValuePair<byte[], byte[]>> ExecuteScan(byte[]? from, byte[]? to)
+    {
+        var comparer = ByteArrayComparer.Instance;
+        var readers = new List<SSTableReader>();
+        try
+        {
+            // Enumerators ordered newest-first: index 0 = MemTable, 1+ = SSTables newest to oldest.
+            var enumerators = new List<IEnumerator<KeyValuePair<byte[], byte[]?>>>();
+            enumerators.Add(_memTable.Scan(from, to).GetEnumerator());
+
+            foreach (var level in _levels)
+                foreach (var path in Enumerable.Reverse(level))
+                {
+                    var reader = new SSTableReader(path);
+                    readers.Add(reader);
+                    enumerators.Add(reader.Scan(from, to).GetEnumerator());
+                }
+
+            // Priority: key asc, then source index asc (lower index = newer = wins ties).
+            var pq = new PriorityQueue<(byte[] key, byte[]? value, int idx), (byte[] key, int idx)>(
+                Comparer<(byte[] key, int idx)>.Create((a, b) =>
+                {
+                    int c = comparer.Compare(a.key, b.key);
+                    return c != 0 ? c : a.idx.CompareTo(b.idx);
+                }));
+
+            for (int i = 0; i < enumerators.Count; i++)
+                if (enumerators[i].MoveNext())
+                {
+                    var kv = enumerators[i].Current;
+                    pq.Enqueue((kv.Key, kv.Value, i), (kv.Key, i));
+                }
+
+            var results = new List<KeyValuePair<byte[], byte[]>>();
+            byte[]? lastKey = null;
+
+            while (pq.Count > 0)
+            {
+                var (key, value, idx) = pq.Dequeue();
+
+                if (lastKey is null || comparer.Compare(lastKey, key) != 0)
+                {
+                    if (value is not null) // exclude tombstones
+                        results.Add(new KeyValuePair<byte[], byte[]>(key, value));
+                    lastKey = key;
+                }
+
+                if (enumerators[idx].MoveNext())
+                {
+                    var kv = enumerators[idx].Current;
+                    pq.Enqueue((kv.Key, kv.Value, idx), (kv.Key, idx));
+                }
+            }
+
+            foreach (var e in enumerators) e.Dispose();
+            return results;
+        }
+        finally
+        {
+            foreach (var r in readers) r.Dispose();
+        }
+    }
+
     private void MaybeFlushMemTable()
     {
         if (_memTable.SizeBytes < _options.MemTableSizeThreshold) return;

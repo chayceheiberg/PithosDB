@@ -60,6 +60,22 @@ public class MemTable
     /// </summary>
     public IEnumerable<KeyValuePair<byte[], byte[]?>> GetSortedEntries() => _data;
 
+    /// <summary>
+    /// Returns entries whose keys fall within [<paramref name="from"/>, <paramref name="to"/>],
+    /// in byte-lexicographic order, including tombstones. Pass <see langword="null"/> for
+    /// either bound to leave it open-ended.
+    /// </summary>
+    public IEnumerable<KeyValuePair<byte[], byte[]?>> Scan(byte[]? from, byte[]? to)
+    {
+        var comparer = ByteArrayComparer.Instance;
+        foreach (var entry in _data)
+        {
+            if (from != null && comparer.Compare(entry.Key, from) < 0) continue;
+            if (to != null && comparer.Compare(entry.Key, to) > 0) yield break;
+            yield return entry;
+        }
+    }
+
     /// <summary>Removes all entries and resets <see cref="SizeBytes"/> to zero.</summary>
     public void Clear()
     {
