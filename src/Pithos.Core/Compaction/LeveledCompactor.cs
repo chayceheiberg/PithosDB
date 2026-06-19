@@ -52,29 +52,39 @@ public sealed class LeveledCompactor
     {
         var comparer = ByteArrayComparer.Instance;
         var enumerators = readers.Select(r => r.ReadAllEntries().GetEnumerator()).ToList();
-        var heap = new SortedDictionary<byte[], (byte[]? value, int readerIndex)>(comparer);
+
+        // Priority: key asc, then negated readerIndex asc (so higher index = newer = dequeued first on ties)
+        var pq = new PriorityQueue<(byte[] key, byte[]? value, int readerIdx), (byte[] key, int negIdx)>(
+            Comparer<(byte[] key, int negIdx)>.Create((a, b) =>
+            {
+                int c = comparer.Compare(a.key, b.key);
+                return c != 0 ? c : a.negIdx.CompareTo(b.negIdx);
+            }));
 
         for (int i = 0; i < enumerators.Count; i++)
         {
             if (enumerators[i].MoveNext())
             {
                 var kv = enumerators[i].Current;
-                heap[kv.Key] = (kv.Value, i);
+                pq.Enqueue((kv.Key, kv.Value, i), (kv.Key, -i));
             }
         }
 
-        while (heap.Count > 0)
+        byte[]? lastKey = null;
+        while (pq.Count > 0)
         {
-            var first = heap.First();
-            heap.Remove(first.Key);
+            var (key, value, idx) = pq.Dequeue();
 
-            yield return new KeyValuePair<byte[], byte[]?>(first.Key, first.Value.value);
+            if (lastKey is null || comparer.Compare(lastKey, key) != 0)
+            {
+                yield return new KeyValuePair<byte[], byte[]?>(key, value);
+                lastKey = key;
+            }
 
-            int idx = first.Value.readerIndex;
             if (enumerators[idx].MoveNext())
             {
                 var kv = enumerators[idx].Current;
-                heap[kv.Key] = (kv.Value, idx);
+                pq.Enqueue((kv.Key, kv.Value, idx), (kv.Key, -idx));
             }
         }
 

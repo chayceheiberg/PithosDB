@@ -23,6 +23,7 @@ public sealed class PithosDb : IDisposable
         _compactor = new LeveledCompactor(directory);
         _wal = new WriteAheadLog(Path.Combine(directory, "wal.log"));
         RecoverFromWal();
+        RecoverSSTables();
     }
 
     public void Put(byte[] key, byte[] value)
@@ -48,7 +49,7 @@ public sealed class PithosDb : IDisposable
     public bool TryGet(byte[] key, out byte[]? value)
     {
         if (_memTable.TryGet(key, out value))
-            return value is not null || IsExplicitTombstone(value);
+            return value is not null;
 
         foreach (var level in _levels)
         {
@@ -91,7 +92,19 @@ public sealed class PithosDb : IDisposable
         }
     }
 
-    private static bool IsExplicitTombstone(byte[]? value) => value is null;
+    private void RecoverSSTables()
+    {
+        foreach (var path in Directory.GetFiles(_directory, "*.sst").OrderBy(File.GetCreationTimeUtc))
+        {
+            var name = Path.GetFileNameWithoutExtension(path);
+            var sep = name.IndexOf('_');
+            if (sep < 2 || !name.StartsWith('L')) continue;
+            if (!int.TryParse(name[1..sep], out int level)) continue;
+
+            while (_levels.Count <= level) _levels.Add([]);
+            _levels[level].Add(path);
+        }
+    }
 
     public void Dispose() => _wal.Dispose();
 }

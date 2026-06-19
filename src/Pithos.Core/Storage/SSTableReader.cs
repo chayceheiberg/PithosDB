@@ -7,6 +7,8 @@ public sealed class SSTableReader : IDisposable
     private readonly FileStream _stream;
     private readonly BinaryReader _reader;
     private readonly List<(byte[] firstKey, long offset)> _index;
+    private readonly BloomFilter _bloom;
+    private readonly long _bloomOffset;
 
     public string Path { get; }
 
@@ -15,12 +17,14 @@ public sealed class SSTableReader : IDisposable
         Path = path;
         _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         _reader = new BinaryReader(_stream);
-        _index = ReadIndex();
+        (_index, _bloom, _bloomOffset) = ReadMetadata();
     }
 
     public bool TryGet(byte[] key, out byte[]? value)
     {
         value = null;
+        if (!_bloom.MightContain(key)) return false;
+
         var blockOffset = FindBlockOffset(key);
         if (blockOffset < 0) return false;
 
@@ -51,9 +55,8 @@ public sealed class SSTableReader : IDisposable
         if (_index.Count == 0) yield break;
 
         _stream.Seek(_index[0].offset, SeekOrigin.Begin);
-        long indexOffset = GetIndexOffset();
 
-        while (_stream.Position < indexOffset)
+        while (_stream.Position < _bloomOffset)
         {
             int count = _reader.ReadInt32();
             for (int i = 0; i < count; i++)
@@ -85,12 +88,22 @@ public sealed class SSTableReader : IDisposable
         return result < 0 ? -1 : _index[result].offset;
     }
 
-    private List<(byte[] firstKey, long offset)> ReadIndex()
+    private (List<(byte[] firstKey, long offset)> index, BloomFilter bloom, long bloomOffset) ReadMetadata()
     {
-        _stream.Seek(-8, SeekOrigin.End);
+        // Footer layout (last 16 bytes): [bloomOffset (8)] [indexOffset (8)]
+        _stream.Seek(-16, SeekOrigin.End);
+        long bloomOffset = _reader.ReadInt64();
         long indexOffset = _reader.ReadInt64();
-        _stream.Seek(indexOffset, SeekOrigin.Begin);
 
+        _stream.Seek(bloomOffset, SeekOrigin.Begin);
+        int hashCount = _reader.ReadInt32();
+        int bitCount = _reader.ReadInt32();
+        var bits = new bool[bitCount];
+        for (int i = 0; i < bitCount; i++)
+            bits[i] = _reader.ReadBoolean();
+        var bloom = new BloomFilter(bits, hashCount);
+
+        _stream.Seek(indexOffset, SeekOrigin.Begin);
         int count = _reader.ReadInt32();
         var index = new List<(byte[], long)>(count);
         for (int i = 0; i < count; i++)
@@ -100,16 +113,8 @@ public sealed class SSTableReader : IDisposable
             var offset = _reader.ReadInt64();
             index.Add((key, offset));
         }
-        return index;
-    }
 
-    private long GetIndexOffset()
-    {
-        long current = _stream.Position;
-        _stream.Seek(-8, SeekOrigin.End);
-        long offset = _reader.ReadInt64();
-        _stream.Seek(current, SeekOrigin.Begin);
-        return offset;
+        return (index, bloom, bloomOffset);
     }
 
     public void Dispose()
