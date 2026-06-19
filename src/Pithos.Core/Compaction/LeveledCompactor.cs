@@ -12,19 +12,22 @@ namespace Pithos.Core.Compaction;
 public sealed class LeveledCompactor
 {
     private readonly string _directory;
+    private readonly PithosOptions _options;
     private readonly int[] _levelSizeLimits;
 
     /// <summary>
-    /// Creates a compactor for the database at <paramref name="directory"/>.
+    /// Creates a compactor for the database at <paramref name="directory"/> using
+    /// the provided <paramref name="options"/>.
     /// </summary>
     /// <param name="directory">Database directory where SSTable files are written.</param>
-    /// <param name="levels">Total number of levels to manage (default 7).</param>
-    public LeveledCompactor(string directory, int levels = 7)
+    /// <param name="options">Options governing level count, size limits, and bloom filter FPR.</param>
+    public LeveledCompactor(string directory, PithosOptions options)
     {
         _directory = directory;
-        _levelSizeLimits = new int[levels];
-        int size = 10;
-        for (int i = 0; i < levels; i++) { _levelSizeLimits[i] = size; size *= 10; }
+        _options = options;
+        _levelSizeLimits = new int[options.LevelCount];
+        int size = options.LevelZeroFileCountLimit;
+        for (int i = 0; i < options.LevelCount; i++) { _levelSizeLimits[i] = size; size *= options.LevelSizeMultiplier; }
     }
 
     /// <summary>
@@ -58,7 +61,7 @@ public sealed class LeveledCompactor
         {
             var merged = MergeEntries(readers);
             string outPath = System.IO.Path.Combine(_directory, $"L{level + 1}_{Guid.NewGuid():N}.sst");
-            SSTableWriter.Write(outPath, merged);
+            SSTableWriter.Write(outPath, merged, _options.BloomFilterFalsePositiveRate);
             levels[level + 1].Add(outPath);
         }
         finally
