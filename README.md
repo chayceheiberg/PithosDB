@@ -68,6 +68,8 @@ src/
         └── LeveledCompactor.cs
 tests/
 └── Pithos.Tests/                    # xUnit test project
+benchmarks/
+└── Pithos.Benchmarks/               # BenchmarkDotNet performance tests
 ```
 
 ---
@@ -163,6 +165,69 @@ using var db = new PithosDb("path/to/data-directory", new PithosOptions
 | `LevelCount` | 7 | Total number of compaction levels |
 | `LevelZeroFileCountLimit` | 10 | L0 file count that triggers compaction |
 | `LevelSizeMultiplier` | 10 | File-count limit multiplier per level |
+
+---
+
+## Performance
+
+Benchmarks run with [BenchmarkDotNet](https://benchmarkdotnet.org/) on .NET 9.0 · RyuJIT AVX2 · 12th Gen Intel Core i7-12700F (20 logical cores).
+
+### Writes
+
+| Method | EntryCount | Mean | Allocated |
+|---|---|---|---|
+| `SequentialPuts` | 1,000 | 4.67 ms | 185 KB |
+| `RandomPuts` | 1,000 | 4.76 ms | 185 KB |
+| `SequentialPuts` | 10,000 | 64.68 ms | 2,371 KB |
+| `RandomPuts` | 10,000 | 61.09 ms | 2,372 KB |
+
+Sequential and random key patterns perform nearly identically — `SortedDictionary` insertion cost is similar either way. Throughput scales roughly linearly with entry count.
+
+### Reads
+
+| Method | Mean | Allocated |
+|---|---|---|
+| `MemTableHit` | 20.6 ns | 0 B |
+| `SSTableHit` | 2,001 µs | 151 KB |
+| `KeyMiss` | 1,941 µs | 155 KB |
+
+A MemTable hit costs **~21 ns** with zero allocation. An SSTable hit costs **~2 ms** because `TryGet` opens and closes a new `SSTableReader` (file handle) per call — a known limitation and a clear target for future optimisation via open-reader pooling. A key miss is similarly expensive: the bloom filter avoids the key scan but each SSTable still pays the file-open cost.
+
+### Concurrency (500 ops per task)
+
+| Method | Readers | Mean | vs. reads-only |
+|---|---|---|---|
+| `ConcurrentReadsOnly` | 2 | 327 µs | baseline |
+| `ConcurrentReadWrite` | 2 | 1,678 µs | **5.1×** |
+| `ConcurrentReadsOnly` | 8 | 784 µs | baseline |
+| `ConcurrentReadWrite` | 8 | 2,398 µs | **3.1×** |
+
+`ReaderWriterLockSlim` allows parallel reads; a single writer's exclusive lock blocks all readers. The penalty shrinks as reader count grows because each write-lock acquisition is amortised across more concurrent readers.
+
+### Compaction
+
+| Method | EntryCount | Mean | vs. no compaction |
+|---|---|---|---|
+| `WritesWithoutCompaction` | 500 | 4.84 ms | baseline |
+| `WritesWithCompaction` | 500 | 4.84 ms | 1.00× |
+| `WritesWithoutCompaction` | 1,000 | 9.44 ms | baseline |
+| `WritesWithCompaction` | 1,000 | 9.02 ms | 0.96× |
+
+At small data sizes the compaction overhead is not measurable — the merge of a few kilobytes of SSTable data is lost in I/O noise.
+
+### Running Benchmarks
+
+```bash
+dotnet run -c Release --project benchmarks/Pithos.Benchmarks
+```
+
+To target a specific class:
+
+```bash
+dotnet run -c Release --project benchmarks/Pithos.Benchmarks -- --filter "*ReadBenchmarks*"
+```
+
+Benchmarks must be run in Release mode. BenchmarkDotNet will error if invoked under Debug.
 
 ---
 
