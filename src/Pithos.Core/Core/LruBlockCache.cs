@@ -7,7 +7,7 @@ namespace Pithos.Core.Core;
 /// instances. Caches raw block bytes keyed by (file path, block offset) so hot blocks
 /// are served from memory rather than re-read from disk on every lookup.
 /// </summary>
-public sealed class BlockCache : IBlockCache
+public sealed class LruBlockCache : IBlockCache
 {
     private sealed class Entry
     {
@@ -22,7 +22,7 @@ public sealed class BlockCache : IBlockCache
     private readonly LinkedList<Entry> _lru = new();
     private readonly object _sync = new();
 
-    public BlockCache(long maxBytes) => _maxBytes = maxBytes;
+    public LruBlockCache(long maxBytes) => _maxBytes = maxBytes;
 
     public bool TryGet(string path, long offset, [NotNullWhen(true)] out byte[]? data)
     {

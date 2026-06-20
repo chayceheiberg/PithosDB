@@ -17,19 +17,19 @@ public class BlockCacheTests : IDisposable
         return b;
     }
 
-    // ── Unit tests for BlockCache ──────────────────────────────────────────
+    // ── Unit tests for LruBlockCache ──────────────────────────────────────────
 
     [Fact]
     public void TryGet_ReturnsFalse_WhenNotCached()
     {
-        var cache = new BlockCache(1024);
+        var cache = new LruBlockCache(1024);
         Assert.False(cache.TryGet("file.sst", 0, out _));
     }
 
     [Fact]
     public void TryGet_ReturnsBlock_AfterPut()
     {
-        var cache = new BlockCache(1024);
+        var cache = new LruBlockCache(1024);
         var data = Block(64, fill: 7);
         cache.Put("file.sst", 0, data);
 
@@ -40,7 +40,7 @@ public class BlockCacheTests : IDisposable
     [Fact]
     public void Put_SecondCallForSameKey_IsNoOp()
     {
-        var cache = new BlockCache(1024);
+        var cache = new LruBlockCache(1024);
         var first  = Block(64, fill: 1);
         var second = Block(64, fill: 2);
 
@@ -55,7 +55,7 @@ public class BlockCacheTests : IDisposable
     public void LRU_EvictsOldestBlock_WhenCapacityExceeded()
     {
         // Capacity for exactly two 64-byte blocks.
-        var cache = new BlockCache(128);
+        var cache = new LruBlockCache(128);
         cache.Put("f", 0,   Block(64, fill: 1)); // oldest
         cache.Put("f", 64,  Block(64, fill: 2)); // capacity full
 
@@ -71,7 +71,7 @@ public class BlockCacheTests : IDisposable
     public void LRU_AccessRefreshesOrder_PreventingEviction()
     {
         // Capacity for two blocks.
-        var cache = new BlockCache(128);
+        var cache = new LruBlockCache(128);
         cache.Put("f", 0,  Block(64, fill: 1)); // A — will be refreshed
         cache.Put("f", 64, Block(64, fill: 2)); // B
 
@@ -89,7 +89,7 @@ public class BlockCacheTests : IDisposable
     [Fact]
     public void EvictFile_RemovesAllBlocksForThatPath()
     {
-        var cache = new BlockCache(1024);
+        var cache = new LruBlockCache(1024);
         cache.Put("a.sst", 0,   Block(64));
         cache.Put("a.sst", 64,  Block(64));
         cache.Put("b.sst", 0,   Block(64));
@@ -104,7 +104,7 @@ public class BlockCacheTests : IDisposable
     [Fact]
     public void EvictFile_NoOp_WhenFileNotCached()
     {
-        var cache = new BlockCache(1024);
+        var cache = new LruBlockCache(1024);
         cache.Put("a.sst", 0, Block(64));
         cache.EvictFile("b.sst"); // should not throw or disturb a.sst
 
@@ -114,7 +114,7 @@ public class BlockCacheTests : IDisposable
     [Fact]
     public async Task ConcurrentPutsAndGets_DoNotCorruptState()
     {
-        var cache = new BlockCache(64 * 200);
+        var cache = new LruBlockCache(64 * 200);
         const int threads = 8;
         const int opsPerThread = 500;
 
@@ -144,7 +144,7 @@ public class BlockCacheTests : IDisposable
 
         SSTableWriter.Write(path, entries);
 
-        var cache = new BlockCache(1024 * 1024);
+        var cache = new LruBlockCache(1024 * 1024);
         using var reader = new SSTableReader(path, cache);
 
         // First pass — cold cache, blocks read from disk and populated.
@@ -172,7 +172,7 @@ public class BlockCacheTests : IDisposable
                 System.Text.Encoding.UTF8.GetBytes("world"))
         ]);
 
-        var cache = new BlockCache(1024 * 1024);
+        var cache = new LruBlockCache(1024 * 1024);
         using var reader = new SSTableReader(path, cache);
 
         // Cold miss, then warm miss (block cached but key not in it).

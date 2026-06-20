@@ -43,7 +43,7 @@ public sealed class PithosDb : IDisposable
         _blockCache = _options.BlockCacheSizeBytes > 0
             ? _options.BlockCacheKind == BlockCacheKind.S3Fifo
                 ? new S3FifoBlockCache(_options.BlockCacheSizeBytes)
-                : new BlockCache(_options.BlockCacheSizeBytes)
+                : new LruBlockCache(_options.BlockCacheSizeBytes)
             : null;
         _compactor = new LeveledCompactor(directory, _options, _readerCache, _blockCache);
         _wal = new WriteAheadLog(Path.Combine(directory, "wal.log"));
