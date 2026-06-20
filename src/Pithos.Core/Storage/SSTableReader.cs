@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Hashing;
+using K4os.Compression.LZ4;
 using Microsoft.Win32.SafeHandles;
 using Pithos.Core.Core;
 
@@ -31,7 +32,8 @@ public sealed class SSTableReader : IDisposable
     /// <param name="path">Absolute path to the SSTable file.</param>
     /// <param name="blockCache">
     /// Optional shared block cache. When provided, block reads are served from
-    /// cache on subsequent accesses to the same block.
+    /// cache on subsequent accesses to the same block. The cache stores decompressed
+    /// block bytes so decompression only happens once per block per cache warm-up.
     /// </param>
     public SSTableReader(string path, IBlockCache? blockCache = null)
     {
@@ -73,28 +75,23 @@ public sealed class SSTableReader : IDisposable
         if (blockOffset < 0) return false;
 
         int blockLen = (int)(blockEnd - blockOffset);
-        int dataLen = blockLen - 4; // trailing 4 bytes are the CRC32 checksum
 
-        // Cache hit — block was already checksum-verified when first read from disk.
+        // Cache hit — block was already decompressed and checksum-verified when first read.
         if (_blockCache is not null && _blockCache.TryGet(Path, blockOffset, out var cached))
             return ParseBlock(cached, key, out value);
 
-        // Cache miss — read block + CRC in one positional I/O call, verify integrity,
-        // then cache/parse the data portion (without the CRC).
+        // Cache miss — read raw block, verify CRC, decompress, cache, then parse.
         byte[] buf = ArrayPool<byte>.Shared.Rent(blockLen);
         try
         {
             ReadAt(_stream.SafeFileHandle, buf.AsSpan(0, blockLen), blockOffset);
             VerifyChecksum(buf.AsSpan(0, blockLen), blockOffset);
+            byte[] decompressed = Decompress(buf.AsSpan(0, blockLen));
 
             if (_blockCache is not null)
-            {
-                var blockCopy = buf.AsSpan(0, dataLen).ToArray();
-                _blockCache.Put(Path, blockOffset, blockCopy);
-                return ParseBlock(blockCopy, key, out value);
-            }
+                _blockCache.Put(Path, blockOffset, decompressed);
 
-            return ParseBlock(buf.AsSpan(0, dataLen), key, out value);
+            return ParseBlock(decompressed, key, out value);
         }
         finally
         {
@@ -141,15 +138,32 @@ public sealed class SSTableReader : IDisposable
         return false;
     }
 
-    private void VerifyChecksum(ReadOnlySpan<byte> blockWithCrc, long blockOffset)
+    // Block on-disk layout: [compression:1][payloadLen:4][payload:N][CRC32:4]
+    // CRC covers [compression][payloadLen bytes][payload].
+
+    private void VerifyChecksum(ReadOnlySpan<byte> block, long blockOffset)
     {
-        int dataLen = blockWithCrc.Length - 4;
-        uint stored = BinaryPrimitives.ReadUInt32LittleEndian(blockWithCrc[dataLen..]);
-        uint computed = Crc32.HashToUInt32(blockWithCrc[..dataLen]);
+        int dataLen = block.Length - 4;
+        uint stored   = BinaryPrimitives.ReadUInt32LittleEndian(block[dataLen..]);
+        uint computed = Crc32.HashToUInt32(block[..dataLen]);
         if (computed != stored)
             throw new InvalidDataException(
                 $"Block checksum mismatch in '{Path}' at offset {blockOffset}: " +
                 $"expected 0x{stored:X8}, computed 0x{computed:X8}.");
+    }
+
+    private static byte[] Decompress(ReadOnlySpan<byte> block)
+    {
+        byte compressionByte = block[0];
+        int payloadLen = BinaryPrimitives.ReadInt32LittleEndian(block[1..]);
+        ReadOnlySpan<byte> payload = block.Slice(5, payloadLen);
+
+        return compressionByte switch
+        {
+            SSTableWriter.CompressionNone => payload.ToArray(),
+            SSTableWriter.CompressionLz4  => LZ4Pickler.Unpickle(payload),
+            _ => throw new InvalidDataException($"Unknown compression type 0x{compressionByte:X2}.")
+        };
     }
 
     // Positional read that retries until the buffer is full. RandomAccess.Read
@@ -177,21 +191,44 @@ public sealed class SSTableReader : IDisposable
 
         while (_stream.Position < _bloomOffset)
         {
-            int count = _reader.ReadInt32();
+            // Block layout: [compression:1][payloadLen:4][payload:N][CRC32:4]
+            byte compressionByte = _reader.ReadByte();
+            int payloadLen = _reader.ReadInt32();
+            byte[] payload = _reader.ReadBytes(payloadLen);
+            _reader.ReadUInt32(); // consume CRC32 (verified on TryGet path; skip here for compaction speed)
+
+            byte[] block = compressionByte switch
+            {
+                SSTableWriter.CompressionNone => payload,
+                SSTableWriter.CompressionLz4  => LZ4Pickler.Unpickle(payload),
+                _ => throw new InvalidDataException($"Unknown compression type 0x{compressionByte:X2}.")
+            };
+
+            int pos = 0;
+            int count = BinaryPrimitives.ReadInt32LittleEndian(block.AsSpan(pos));
+            pos += 4;
+
             for (int i = 0; i < count; i++)
             {
-                var keyLen = _reader.ReadInt32();
-                var key = _reader.ReadBytes(keyLen);
-                var isTombstone = _reader.ReadBoolean();
+                int keyLen = BinaryPrimitives.ReadInt32LittleEndian(block.AsSpan(pos));
+                pos += 4;
+                var key = block[pos..(pos + keyLen)];
+                pos += keyLen;
+
+                bool isTombstone = block[pos] != 0;
+                pos += 1;
+
                 byte[]? value = null;
                 if (!isTombstone)
                 {
-                    var valLen = _reader.ReadInt32();
-                    value = _reader.ReadBytes(valLen);
+                    int valLen = BinaryPrimitives.ReadInt32LittleEndian(block.AsSpan(pos));
+                    pos += 4;
+                    value = block[pos..(pos + valLen)];
+                    pos += valLen;
                 }
+
                 yield return new KeyValuePair<byte[], byte[]?>(key, value);
             }
-            _reader.ReadUInt32(); // consume per-block CRC32
         }
     }
 

@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using System.IO.Hashing;
+using K4os.Compression.LZ4;
 using Pithos.Core.Core;
 
 namespace Pithos.Core.Storage;
@@ -8,7 +10,7 @@ namespace Pithos.Core.Storage;
 /// <para>
 /// File layout:
 /// <code>
-/// [ data blocks (≤4 KB each) ]  ← each block ends with a CRC32 checksum (4 bytes)
+/// [ data blocks (≤4 KB each) ]  ← each block: [compression:1][payloadLen:4][payload:N][CRC32:4]
 /// [ bloom filter section     ]  ← hashCount (int32), bitCount (int32), bits (bool[])
 /// [ sparse index section     ]  ← entry count (int32), (keyLen, key, blockOffset)…
 /// [ footer (16 bytes)        ]  ← bloomOffset (int64), indexOffset (int64)
@@ -18,6 +20,10 @@ namespace Pithos.Core.Storage;
 public sealed class SSTableWriter
 {
     private const int BlockSize = 4096;
+
+    // Compression byte values stored in block headers.
+    internal const byte CompressionNone = 0;
+    internal const byte CompressionLz4  = 1;
 
     /// <summary>
     /// Writes <paramref name="entries"/> to a new SSTable file at <paramref name="path"/>.
@@ -31,8 +37,9 @@ public sealed class SSTableWriter
     /// <param name="bloomFalsePositiveRate">
     /// Target false positive rate for the bloom filter. Defaults to 1%.
     /// </param>
+    /// <param name="compression">Block compression algorithm. Defaults to <see cref="CompressionKind.None"/>.</param>
     public static void Write(string path, IEnumerable<KeyValuePair<byte[], byte[]?>> entries,
-        double bloomFalsePositiveRate = 0.01)
+        double bloomFalsePositiveRate = 0.01, CompressionKind compression = CompressionKind.None)
     {
         var entryList = entries.ToList();
 
@@ -51,11 +58,11 @@ public sealed class SSTableWriter
         {
             blockBuffer.Add(entry);
             if (EstimateBlockSize(blockBuffer) >= BlockSize)
-                FlushBlock(writer, blockBuffer, index, ref blockStart);
+                FlushBlock(writer, blockBuffer, index, ref blockStart, compression);
         }
 
         if (blockBuffer.Count > 0)
-            FlushBlock(writer, blockBuffer, index, ref blockStart);
+            FlushBlock(writer, blockBuffer, index, ref blockStart, compression);
 
         // Bloom filter section
         long bloomOffset = stream.Position;
@@ -84,12 +91,12 @@ public sealed class SSTableWriter
         BinaryWriter writer,
         List<KeyValuePair<byte[], byte[]?>> entries,
         List<(byte[] firstKey, long offset)> index,
-        ref long blockStart)
+        ref long blockStart,
+        CompressionKind compression)
     {
         index.Add((entries[0].Key, blockStart));
 
-        // Buffer entries into a MemoryStream so we can compute CRC32 over the
-        // exact serialized bytes before writing them to the file.
+        // Serialize entries into a MemoryStream.
         using var ms = new MemoryStream();
         using (var bw = new BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true))
         {
@@ -108,9 +115,36 @@ public sealed class SSTableWriter
             }
         }
 
-        ReadOnlySpan<byte> blockData = ms.GetBuffer().AsSpan(0, (int)ms.Length);
-        writer.Write(blockData);
-        writer.Write(Crc32.HashToUInt32(blockData));
+        ReadOnlySpan<byte> raw = ms.GetBuffer().AsSpan(0, (int)ms.Length);
+
+        // Optionally compress.
+        byte compressionByte;
+        byte[] payload;
+        if (compression == CompressionKind.Lz4)
+        {
+            compressionByte = CompressionLz4;
+            payload = LZ4Pickler.Pickle(raw);
+        }
+        else
+        {
+            compressionByte = CompressionNone;
+            payload = raw.ToArray();
+        }
+
+        // Block on-disk: [compression:1][payloadLen:4][payload:N][CRC32:4]
+        // CRC covers the compression byte + payloadLen bytes + payload.
+        Span<byte> payloadLenBytes = stackalloc byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(payloadLenBytes, payload.Length);
+
+        var crc = new Crc32();
+        crc.Append(stackalloc byte[1] { compressionByte });
+        crc.Append(payloadLenBytes);
+        crc.Append(payload);
+
+        writer.Write(compressionByte);
+        writer.Write(payload.Length);
+        writer.Write(payload);
+        writer.Write(crc.GetCurrentHashAsUInt32());
 
         blockStart = writer.BaseStream.Position;
         entries.Clear();

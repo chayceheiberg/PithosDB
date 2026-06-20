@@ -75,7 +75,7 @@ public sealed class LeveledCompactor
         {
             var merged = MergeEntries(readers);
             string outPath = System.IO.Path.Combine(_directory, $"L{level + 1}_{Guid.NewGuid():N}.sst");
-            SSTableWriter.Write(outPath, merged, _options.BloomFilterFalsePositiveRate);
+            SSTableWriter.Write(outPath, merged, _options.BloomFilterFalsePositiveRate, _options.Compression);
             levels[level + 1].Add(outPath);
             _readerCache[outPath] = new SSTableReader(outPath, _blockCache);
         }

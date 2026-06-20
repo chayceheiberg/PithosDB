@@ -166,7 +166,7 @@ public sealed class PithosDb : IDisposable
         if (_levels.Count == 0) _levels.Add([]);
 
         string sstPath = Path.Combine(_directory, $"L0_{Guid.NewGuid():N}.sst");
-        SSTableWriter.Write(sstPath, _memTable.GetSortedEntries(), _options.BloomFilterFalsePositiveRate);
+        SSTableWriter.Write(sstPath, _memTable.GetSortedEntries(), _options.BloomFilterFalsePositiveRate, _options.Compression);
         _levels[0].Add(sstPath);
         _readerCache[sstPath] = new SSTableReader(sstPath, _blockCache);
         _memTable.Clear();
