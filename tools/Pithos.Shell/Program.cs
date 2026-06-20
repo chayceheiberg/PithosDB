@@ -9,9 +9,7 @@ if (args.Length == 0)
 
 string dbPath = args[0];
 
-Console.WriteLine($"Pithos Shell — {dbPath}");
-Console.WriteLine("Type 'help' for available commands.");
-Console.WriteLine();
+PrintBanner(dbPath);
 
 using var db = new PithosDb(dbPath);
 
@@ -101,6 +99,38 @@ while (true)
 }
 
 return 0;
+
+static void PrintBanner(string dbPath)
+{
+    static void Jar(string s) { Console.ForegroundColor = ConsoleColor.DarkYellow; Console.WriteLine(s); }
+
+    Jar("         _____      ");
+    Jar("       ,'     ',    ");
+    Jar("      /         \\  ");
+    Jar("     | . . . . . | ");
+    Console.ForegroundColor = ConsoleColor.DarkYellow;
+    Console.Write("     |  ");
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.Write("PITHOS");
+    Console.ForegroundColor = ConsoleColor.DarkYellow;
+    Console.WriteLine("   | ");
+    Jar("     | . . . . . | ");
+    Jar("     |           | ");
+    Jar("     |  ~     ~  | ");
+    Jar("     |           | ");
+    Jar("      \\         /  ");
+    Jar("       '-_____-'   ");
+    Jar("           |       ");
+    Jar("       ____|____   ");
+    Jar("      |_________|  ");
+    Console.ResetColor();
+    Console.WriteLine();
+    Console.ForegroundColor = ConsoleColor.DarkGray;
+    Console.WriteLine($"  db: {dbPath}");
+    Console.ResetColor();
+    Console.WriteLine("  Type 'help' for available commands.");
+    Console.WriteLine();
+}
 
 static (string first, string rest) Split(string s)
 {
