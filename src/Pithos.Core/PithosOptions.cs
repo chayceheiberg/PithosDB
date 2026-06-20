@@ -2,6 +2,18 @@ using Pithos.Core.Core;
 
 namespace Pithos.Core;
 
+/// <summary>SSTable block compression algorithm.</summary>
+public enum CompressionKind
+{
+    /// <summary>No compression. Best for already-compressed data or latency-critical workloads.</summary>
+    None,
+    /// <summary>
+    /// LZ4 block compression. Extremely fast decompression (~5 GB/s), modest CPU cost on writes.
+    /// Recommended for most workloads — reduces I/O without measurably increasing read latency.
+    /// </summary>
+    Lz4,
+}
+
 /// <summary>Block cache eviction policy.</summary>
 public enum BlockCacheKind
 {
@@ -66,6 +78,16 @@ public sealed class PithosOptions
     /// Ignored when <see cref="BlockCacheSizeBytes"/> is 0.
     /// </summary>
     public BlockCacheKind BlockCacheKind { get; init; } = BlockCacheKind.Lru;
+
+    /// <summary>
+    /// Block compression algorithm applied when writing SSTables. Compressed blocks are
+    /// transparently decompressed on read. Default: <see cref="CompressionKind.None"/>.
+    /// <para>
+    /// All SSTables in a database must be written with the same algorithm. Changing
+    /// <see cref="Compression"/> on an existing database will produce unreadable files.
+    /// </para>
+    /// </summary>
+    public CompressionKind Compression { get; init; } = CompressionKind.None;
 
     /// <summary>Default options — equivalent to <c>new PithosOptions()</c>.</summary>
     public static readonly PithosOptions Default = new();
