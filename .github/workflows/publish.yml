@@ -1,0 +1,58 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  publish:
+    name: Pack & Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create a GitHub Release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore
+        run: dotnet restore PithosDB.sln
+
+      - name: Build
+        run: dotnet build PithosDB.sln --no-restore -c Release
+
+      - name: Test
+        run: dotnet test PithosDB.sln --no-build -c Release --logger "console;verbosity=normal"
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Pack
+        run: |
+          dotnet pack src/PithosDB.Core/PithosDB.Core.csproj \
+            -c Release --no-build \
+            -p:Version=${{ steps.version.outputs.VERSION }}
+          dotnet pack tools/PithosDB.Shell/PithosDB.Shell.csproj \
+            -c Release --no-build \
+            -p:Version=${{ steps.version.outputs.VERSION }}
+
+      - name: Push to NuGet.org
+        run: |
+          dotnet nuget push "nupkg/*.nupkg" \
+            --api-key ${{ secrets.NUGET_API_KEY }} \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" nupkg/*.nupkg \
+            --title "PithosDB ${{ steps.version.outputs.VERSION }}" \
+            --generate-notes

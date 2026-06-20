@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore
+        run: dotnet restore PithosDB.sln
+
+      - name: Build
+        run: dotnet build PithosDB.sln --no-restore -c Release
+
+      - name: Test
+        run: dotnet test PithosDB.sln --no-build -c Release --logger "console;verbosity=normal"
