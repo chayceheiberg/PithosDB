@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\PithosDB.Core\PithosDB.Core.csproj" />
@@ -9,6 +9,16 @@
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>pithosdb</ToolCommandName>
+    <PackageId>PithosDB.Shell</PackageId>
+    <Version>1.3.0</Version>
+    <Authors>Chayce Heiberg</Authors>
+    <Description>Interactive shell for PithosDB — an LSM-tree embedded key-value store.</Description>
+    <PackageOutputPath>../../nupkg</PackageOutputPath>
   </PropertyGroup>
 
 </Project>
