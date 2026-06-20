@@ -69,6 +69,32 @@ public sealed class PithosDb : IDisposable
     }
 
     /// <summary>
+    /// Applies all operations in <paramref name="batch"/> atomically. The entire
+    /// batch is written to the WAL as a single CRC-guarded record before any
+    /// MemTable mutation occurs, so either every operation survives a crash or none do.
+    /// </summary>
+    public void Write(WriteBatch batch)
+    {
+        if (batch.Operations.Count == 0) return;
+
+        _lock.EnterWriteLock();
+        try
+        {
+            _wal.AppendBatch(batch.Operations);
+            foreach (var (type, key, value) in batch.Operations)
+            {
+                if (type == WalEntryType.Put) _memTable.Put(key, value!);
+                else _memTable.Delete(key);
+            }
+            MaybeFlushMemTable();
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
     /// Deletes <paramref name="key"/> by writing a tombstone. Subsequent
     /// <see cref="TryGet"/> calls for this key return <see langword="false"/>
     /// until a new value is written. The tombstone is physically removed during

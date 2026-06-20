@@ -1,3 +1,4 @@
+using System.IO.Hashing;
 using Pithos.Core.Core;
 
 namespace Pithos.Core.Storage;
@@ -7,7 +8,7 @@ namespace Pithos.Core.Storage;
 /// <para>
 /// File layout:
 /// <code>
-/// [ data blocks (≤4 KB each) ]
+/// [ data blocks (≤4 KB each) ]  ← each block ends with a CRC32 checksum (4 bytes)
 /// [ bloom filter section     ]  ← hashCount (int32), bitCount (int32), bits (bool[])
 /// [ sparse index section     ]  ← entry count (int32), (keyLen, key, blockOffset)…
 /// [ footer (16 bytes)        ]  ← bloomOffset (int64), indexOffset (int64)
@@ -86,19 +87,31 @@ public sealed class SSTableWriter
         ref long blockStart)
     {
         index.Add((entries[0].Key, blockStart));
-        writer.Write(entries.Count);
-        foreach (var (key, value) in entries)
+
+        // Buffer entries into a MemoryStream so we can compute CRC32 over the
+        // exact serialized bytes before writing them to the file.
+        using var ms = new MemoryStream();
+        using (var bw = new BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true))
         {
-            writer.Write(key.Length);
-            writer.Write(key);
-            bool isTombstone = value is null;
-            writer.Write(isTombstone);
-            if (!isTombstone)
+            bw.Write(entries.Count);
+            foreach (var (key, value) in entries)
             {
-                writer.Write(value!.Length);
-                writer.Write(value);
+                bw.Write(key.Length);
+                bw.Write(key);
+                bool isTombstone = value is null;
+                bw.Write(isTombstone);
+                if (!isTombstone)
+                {
+                    bw.Write(value!.Length);
+                    bw.Write(value);
+                }
             }
         }
+
+        ReadOnlySpan<byte> blockData = ms.GetBuffer().AsSpan(0, (int)ms.Length);
+        writer.Write(blockData);
+        writer.Write(Crc32.HashToUInt32(blockData));
+
         blockStart = writer.BaseStream.Position;
         entries.Clear();
     }

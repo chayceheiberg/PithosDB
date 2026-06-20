@@ -8,7 +8,7 @@
 
   <PropertyGroup>
     <PackageId>Pithos</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Authors>Chayce Heiberg</Authors>
     <Description>A persistent, embedded key-value storage engine built on an LSM-tree architecture. Supports Put, Delete, and TryGet with bloom-filter-accelerated SSTable lookups, leveled compaction, and a Write-Ahead Log for crash recovery. All operations are thread-safe.</Description>
     <PackageTags>lsm-tree;embedded;key-value;storage;database;nosql</PackageTags>
@@ -19,6 +19,10 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageOutputPath>../../nupkg</PackageOutputPath>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.IO.Hashing" Version="9.0.*" />
+  </ItemGroup>
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />

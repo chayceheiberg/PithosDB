@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.IO.Hashing;
 using Microsoft.Win32.SafeHandles;
 using Pithos.Core.Core;
 
@@ -59,6 +60,10 @@ public sealed class SSTableReader : IDisposable
     /// The stored value on success, <see langword="null"/> for a tombstone,
     /// or <see langword="null"/> when the method returns <see langword="false"/>.
     /// </param>
+    /// <exception cref="InvalidDataException">
+    /// Thrown when the block's CRC32 checksum does not match the stored checksum,
+    /// indicating data corruption.
+    /// </exception>
     public bool TryGet(byte[] key, out byte[]? value)
     {
         value = null;
@@ -68,27 +73,28 @@ public sealed class SSTableReader : IDisposable
         if (blockOffset < 0) return false;
 
         int blockLen = (int)(blockEnd - blockOffset);
+        int dataLen = blockLen - 4; // trailing 4 bytes are the CRC32 checksum
 
-        // Cache hit — no I/O needed.
+        // Cache hit — block was already checksum-verified when first read from disk.
         if (_blockCache is not null && _blockCache.TryGet(Path, blockOffset, out var cached))
             return ParseBlock(cached, key, out value);
 
-        // Cache miss — read the entire block in one positional I/O call, store a
-        // heap copy in the cache, then parse from memory. O(1) syscalls regardless
-        // of how many entries must be scanned.
+        // Cache miss — read block + CRC in one positional I/O call, verify integrity,
+        // then cache/parse the data portion (without the CRC).
         byte[] buf = ArrayPool<byte>.Shared.Rent(blockLen);
         try
         {
             ReadAt(_stream.SafeFileHandle, buf.AsSpan(0, blockLen), blockOffset);
+            VerifyChecksum(buf.AsSpan(0, blockLen), blockOffset);
 
             if (_blockCache is not null)
             {
-                var blockCopy = buf.AsSpan(0, blockLen).ToArray();
+                var blockCopy = buf.AsSpan(0, dataLen).ToArray();
                 _blockCache.Put(Path, blockOffset, blockCopy);
                 return ParseBlock(blockCopy, key, out value);
             }
 
-            return ParseBlock(buf.AsSpan(0, blockLen), key, out value);
+            return ParseBlock(buf.AsSpan(0, dataLen), key, out value);
         }
         finally
         {
@@ -135,6 +141,17 @@ public sealed class SSTableReader : IDisposable
         return false;
     }
 
+    private void VerifyChecksum(ReadOnlySpan<byte> blockWithCrc, long blockOffset)
+    {
+        int dataLen = blockWithCrc.Length - 4;
+        uint stored = BinaryPrimitives.ReadUInt32LittleEndian(blockWithCrc[dataLen..]);
+        uint computed = Crc32.HashToUInt32(blockWithCrc[..dataLen]);
+        if (computed != stored)
+            throw new InvalidDataException(
+                $"Block checksum mismatch in '{Path}' at offset {blockOffset}: " +
+                $"expected 0x{stored:X8}, computed 0x{computed:X8}.");
+    }
+
     // Positional read that retries until the buffer is full. RandomAccess.Read
     // does not advance _stream.Position, so concurrent callers share the handle safely.
     private static void ReadAt(SafeFileHandle handle, Span<byte> buffer, long offset)
@@ -174,6 +191,7 @@ public sealed class SSTableReader : IDisposable
                 }
                 yield return new KeyValuePair<byte[], byte[]?>(key, value);
             }
+            _reader.ReadUInt32(); // consume per-block CRC32
         }
     }
 
