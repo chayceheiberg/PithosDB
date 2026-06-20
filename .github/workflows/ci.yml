@@ -26,4 +26,10 @@ jobs:
         run: dotnet build PithosDB.sln --no-restore -c Release
 
       - name: Test
-        run: dotnet test PithosDB.sln --no-build -c Release --logger "console;verbosity=normal"
+        run: dotnet test PithosDB.sln --no-build -c Release --logger "console;verbosity=normal" --collect:"XPlat Code Coverage" --results-directory coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          directory: coverage
+          token: ${{ secrets.CODECOV_TOKEN }}
