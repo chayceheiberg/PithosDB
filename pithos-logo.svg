@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300" width="300" height="300">
+  <!-- lip -->
+  <rect x="135" y="58" width="30" height="10" rx="3" fill="#993C1D"/>
+
+  <!-- body -->
+  <path d="M138,68
+    L138,90
+    Q138,100 130,108
+    Q112,124 108,150
+    Q104,178 108,200
+    Q112,224 150,224
+    Q188,224 192,200
+    Q196,178 192,150
+    Q188,124 170,108
+    Q162,100 162,90
+    L162,68
+    Z" fill="#993C1D"/>
+
+  <!-- left handle -->
+  <path d="M122,108 Q96,112 92,140 Q90,158 104,164" fill="none" stroke="#993C1D" stroke-width="9" stroke-linecap="round"/>
+  <!-- right handle -->
+  <path d="M178,108 Q204,112 208,140 Q210,158 196,164" fill="none" stroke="#993C1D" stroke-width="9" stroke-linecap="round"/>
+
+  <!-- base accent line -->
+  <path d="M118,202 Q150,212 182,202" fill="none" stroke="#FAECE7" stroke-width="2.5" opacity="0.7"/>
+</svg>

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="pithos-logo.svg" alt="Pithos" width="160" />
+</p>
+
 # Pithos
 
 A persistent, embedded key-value storage engine built on an [LSM-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree) (Log-Structured Merge-Tree) architecture. Written in C# targeting .NET 9.
