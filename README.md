@@ -24,35 +24,48 @@ An in-memory `SortedDictionary<byte[], byte[]?>` that holds the most recent writ
 #### Write-Ahead Log (`Core/WriteAheadLog.cs`)
 An append-only binary log written to `wal.log` in the database directory. Every `Put`, `Delete`, and `WriteBatch` is durably fsynced here before being applied to the MemTable. On startup, the WAL is replayed to restore any unflushed writes. The log is deleted and recreated after each successful flush.
 
-Batch entries are written as a single CRC32-guarded record — either the entire batch survives a crash or none of it does. A truncated or corrupt batch record causes replay to stop at that point, so partially-written batches are silently discarded.
+Batch entries are written as a single CRC32-guarded record — either the entire batch survives a crash or none of it does. Individual `Put` and `Delete` records are also CRC32-guarded; a truncated or corrupt record causes replay to stop at that point, discarding only the partial write.
 
 #### SSTable (`Storage/SSTableWriter.cs`, `Storage/SSTableReader.cs`)
 Immutable, sorted files written when the MemTable is flushed. Each file has the following layout:
 
 ```
-┌─────────────────────────────────┐
-│  Data blocks (4 KB each)        │  ← key-value entries, sorted
-│    └── CRC32 checksum (4 bytes) │  ← per-block integrity check
-├─────────────────────────────────┤
-│  Bloom filter                   │  ← MurmurHash3, configurable FPR (default 1%)
-├─────────────────────────────────┤
-│  Sparse index                   │  ← first key + offset per block
-├─────────────────────────────────┤
-│  Footer (16 bytes)              │  ← bloomOffset (8) + indexOffset (8)
-└─────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│  Data blocks (≤4 KB each)                   │
+│    [compression: 1 byte]                    │  ← 0 = none, 1 = LZ4
+│    [payload length: 4 bytes]                │
+│    [payload: compressed or raw block data]  │
+│    [CRC32: 4 bytes]                         │  ← over compression byte + length + payload
+├─────────────────────────────────────────────┤
+│  Bloom filter                               │  ← MurmurHash3, configurable FPR (default 1%)
+├─────────────────────────────────────────────┤
+│  Sparse index                               │  ← first key + offset per block
+├─────────────────────────────────────────────┤
+│  Footer (16 bytes)                          │  ← bloomOffset (8) + indexOffset (8)
+└─────────────────────────────────────────────┘
 ```
 
-Each data block ends with a CRC32 checksum (`System.IO.Hashing.Crc32`). The checksum is verified on every block read; a mismatch throws `InvalidDataException` before any data is returned.
+Each data block carries a CRC32 checksum (`System.IO.Hashing.Crc32`) over the compression byte, payload length, and payload. The checksum is verified on every block read from disk; a mismatch throws `InvalidDataException` before any data is returned.
 
 Point lookups consult the bloom filter first; a definite miss skips all block I/O for that file. Range scans use the sparse index to seek directly to the first candidate block.
+
+#### Block Compression
+SSTable blocks can be compressed with **LZ4** (`K4os.Compression.LZ4`) before being written. Set `Compression = CompressionKind.Lz4` on `PithosOptions` to enable it.
+
+The compression byte stored in each block header allows the reader to handle blocks transparently regardless of how they were written. The block cache stores **decompressed** bytes, so each block is decompressed at most once per cache warm-up cycle.
+
+Benchmarks show LZ4 adds only **~3% read latency overhead** on cache-cold reads while meaningfully reducing SSTable file sizes for compressible data.
 
 #### Bloom Filter (`Core/BloomFilter.cs`)
 A bit-array bloom filter using double-hashing over MurmurHash3. Built per SSTable with a configurable false positive rate (default **1%**). Serialized into the SSTable file and loaded into memory on open. A definite miss means no disk reads are needed for that file.
 
-#### Block Cache (`Core/BlockCache.cs`)
-An LRU cache of recently-read SSTable blocks, shared across all open `SSTableReader` instances. When a block is read from disk its data (excluding the CRC) is stored in the cache keyed by `(filePath, blockOffset)`. Subsequent lookups for the same block are served entirely from memory. The cache evicts the least-recently-used block when its byte capacity is exceeded. Cache entries for a compacted file are evicted before the file is deleted.
+#### Block Cache (`Core/LruBlockCache.cs`, `Core/S3FifoBlockCache.cs`)
+A shared block cache reduces repeated disk reads for hot blocks. Both implementations satisfy the `IBlockCache` interface and are selected via `BlockCacheKind` on `PithosOptions`.
 
-Enabled by default (8 MB). Set `BlockCacheSizeBytes = 0` to disable.
+- **`LruBlockCache`** — Least-Recently-Used eviction. Good general-purpose default. Implemented as a `LinkedList` + `Dictionary` with byte-capacity eviction.
+- **`S3FifoBlockCache`** — S3-FIFO eviction policy (SOSP 2023). New blocks enter a small probation queue (~10% of capacity); blocks accessed more than once are promoted to the main queue (~90%). A ghost set of recently-evicted keys lets re-admitted blocks skip probation. Provides better scan-pollution resistance than LRU with lower per-hit overhead (no structural mutation on cache hit).
+
+Blocks are cached after the first disk read and checksum verification. Cache entries for a compacted file are evicted before the file is deleted. Enabled by default (8 MB LRU). Set `BlockCacheSizeBytes = 0` to disable.
 
 #### Leveled Compactor (`Compaction/LeveledCompactor.cs`)
 Runs a configurable leveled compaction strategy (default **7 levels**, **10× size multiplier**). When a level reaches its file-count limit, all its SSTables are merged into a single SSTable at the next level using a k-way merge (via `PriorityQueue`) that deduplicates keys, keeping the value from the newest source file.
@@ -65,13 +78,15 @@ Runs a configurable leveled compaction strategy (default **7 levels**, **10× si
 src/
 └── Pithos.Core/
     ├── PithosDb.cs                  # Public API / orchestration
-    ├── PithosOptions.cs             # Runtime configuration
+    ├── PithosOptions.cs             # Runtime configuration (CompressionKind, BlockCacheKind)
     ├── WriteBatch.cs                # Atomic multi-key write batch
     ├── Core/
     │   ├── MemTable.cs
     │   ├── WriteAheadLog.cs
     │   ├── BloomFilter.cs
-    │   ├── BlockCache.cs            # LRU block cache
+    │   ├── IBlockCache.cs           # Block cache interface
+    │   ├── LruBlockCache.cs         # LRU eviction policy
+    │   ├── S3FifoBlockCache.cs      # S3-FIFO eviction policy (SOSP 2023)
     │   └── ByteArrayComparer.cs
     ├── Storage/
     │   ├── SSTableWriter.cs
@@ -183,6 +198,8 @@ using var db = new PithosDb("path/to/data-directory", new PithosOptions
     LevelZeroFileCountLimit      = 4,                // compact L0 after 4 files
     LevelSizeMultiplier          = 10,               // each level is 10× the previous
     BlockCacheSizeBytes          = 32 * 1024 * 1024, // 32 MB block cache
+    BlockCacheKind               = BlockCacheKind.S3Fifo, // S3-FIFO eviction
+    Compression                  = CompressionKind.Lz4,   // LZ4 block compression
 });
 ```
 
@@ -193,7 +210,9 @@ using var db = new PithosDb("path/to/data-directory", new PithosOptions
 | `LevelCount` | 7 | Total number of compaction levels |
 | `LevelZeroFileCountLimit` | 10 | L0 file count that triggers compaction |
 | `LevelSizeMultiplier` | 10 | File-count limit multiplier per level |
-| `BlockCacheSizeBytes` | 8 MB | Max bytes for the shared LRU block cache; set to 0 to disable |
+| `BlockCacheSizeBytes` | 8 MB | Max bytes for the shared block cache; set to 0 to disable |
+| `BlockCacheKind` | `Lru` | Eviction policy: `Lru` or `S3Fifo` |
+| `Compression` | `None` | Block compression: `None` or `Lz4` |
 
 ---
 
@@ -205,33 +224,59 @@ Benchmarks run with [BenchmarkDotNet](https://benchmarkdotnet.org/) on .NET 9.0 
 
 | Method | EntryCount | Mean | Allocated |
 |---|---|---|---|
-| `SequentialPuts` | 1,000 | 4.83 ms | 195 KB |
-| `RandomPuts` | 1,000 | 4.88 ms | 195 KB |
-| `SequentialPuts` | 10,000 | 67.83 ms | 2,552 KB |
-| `RandomPuts` | 10,000 | 64.04 ms | 2,553 KB |
+| `SequentialPuts` | 1,000 | 5.91 ms | 612 KB |
+| `RandomPuts` | 1,000 | 5.79 ms | 612 KB |
+| `SequentialPuts` | 10,000 | 90.4 ms | 8,728 KB |
+| `RandomPuts` | 10,000 | 97.4 ms | 8,728 KB |
 
-Sequential and random key patterns perform nearly identically — `SortedDictionary` insertion cost is similar either way. Throughput scales roughly linearly with entry count. The ~5% allocation increase over older numbers reflects the SSTableReader cache being populated on each flush.
+Sequential and random key patterns perform nearly identically — `SortedDictionary` insertion cost is similar either way. Write throughput is dominated by fsync cost on the WAL.
 
 ### Reads
 
 | Method | Mean | Allocated |
 |---|---|---|
-| `MemTableHit` | 21.1 ns | 0 B |
-| `SSTableHit` | 3.0 µs | 2.1 KB |
-| `KeyMiss` | 3.3 µs | 2.1 KB |
+| `MemTableHit` | 20.9 ns | 0 B |
+| `SSTableHit` | 1,479 ns | 2,192 B |
+| `KeyMiss` | 1,761 ns | 2,160 B |
 
-A MemTable hit costs **~21 ns** with zero allocation. An SSTable hit and a key miss both cost **~3 µs** — the bloom filter and sparse index are loaded once per file at open time and kept in memory; the only I/O per lookup is a single positional `RandomAccess.Read` call that fetches the relevant 4 KB data block directly through the cached file handle. The block is parsed entirely from memory, so the cost is one syscall regardless of how many entries must be scanned. A miss costs only 10% more than a hit because the bloom filter (1% FPR) occasionally passes through a false positive that requires reading a block.
+A MemTable hit costs **~21 ns** with zero allocation. An SSTable hit costs **~1.5 µs** — the bloom filter and sparse index are loaded once per file at open time and kept in memory; the only I/O per lookup is a single positional `RandomAccess.Read` call that fetches the relevant block. A miss costs ~19% more than a hit because the bloom filter (1% FPR) occasionally passes through a false positive that requires reading a block.
 
-> **Optimization history:** the baseline opened and closed a full `SSTableReader` (bloom filter + index I/O) on every `TryGet` call — **~2 ms, 151 KB**. Three incremental improvements reduced this to the current numbers: (1) caching reader instances so bloom and index are always in memory, (2) replacing per-call `FileStream` opens with positional `RandomAccess` reads on a persistent handle, and (3) pre-reading the full block in one syscall before parsing, eliminating per-field I/O overhead on block scans. Net result: **667× faster, 72× fewer allocations**.
+> **Optimization history:** the baseline opened and closed a full `SSTableReader` (bloom filter + index I/O) on every `TryGet` call — **~2 ms, 151 KB**. Three incremental improvements reduced this to the current numbers: (1) caching reader instances so bloom and index are always in memory, (2) replacing per-call `FileStream` opens with positional `RandomAccess` reads on a persistent handle, and (3) pre-reading the full block in one syscall before parsing, eliminating per-field I/O overhead on block scans. Net result: **>1,000× faster, 72× fewer allocations**.
+
+### Block Cache
+
+Benchmarks use a **256 KB cache** (intentionally small) against 5,000 entries to stress eviction behaviour. Reads follow a 90/10 pattern: 90% of accesses target the hot 10% of keys, with occasional cold-key sweeps to stress scan-pollution resistance.
+
+| Method | Mean | Ratio | Allocated |
+|---|---|---|---|
+| `NoCache_HotRead` | 6,353 ns | 1.00 | 5,423 B |
+| `Lru_HotRead` | 1,672 ns | 0.26 | 878 B |
+| `S3Fifo_HotRead` | 1,663 ns | 0.26 | 878 B |
+| `NoCache_Mixed` | 6,407 ns | 1.01 | 5,349 B |
+| `Lru_Mixed` | 1,259 ns | 0.20 | 1,028 B |
+| `S3Fifo_Mixed` | 1,149 ns | 0.18 | 1,022 B |
+
+Both caches deliver **~3.8× speedup** on hot reads. On the mixed workload, S3-FIFO outperforms LRU by ~9% — cold-key scans land in S3-FIFO's small probation queue and are evicted without displacing hot blocks from the main queue.
+
+### Block Compression
+
+Read benchmarks with the block cache **disabled** so every lookup decompresses from disk, making the LZ4 overhead directly visible.
+
+| Method | Mean | Ratio | Allocated |
+|---|---|---|---|
+| `Read_None` | 2,684 ns | 1.00 | 4.64 KB |
+| `Read_Lz4` | 2,769 ns | 1.03 | 4.64 KB |
+
+LZ4 decompression adds only **~3% read latency** on cache-cold reads. When the block cache is enabled the overhead is fully amortised — a block is decompressed once on first read and served from memory on all subsequent accesses. Enabling LZ4 reduces SSTable file sizes for compressible data with negligible read-path cost.
 
 ### Concurrency (500 ops per task)
 
 | Method | Readers | Mean | vs. reads-only |
 |---|---|---|---|
-| `ConcurrentReadsOnly` | 2 | 324 µs | baseline |
-| `ConcurrentReadWrite` | 2 | 1,688 µs | **5.2×** |
-| `ConcurrentReadsOnly` | 8 | 688 µs | baseline |
-| `ConcurrentReadWrite` | 8 | 2,133 µs | **3.1×** |
+| `ConcurrentReadsOnly` | 2 | 300 µs | baseline |
+| `ConcurrentReadWrite` | 2 | 2,028 µs | **6.8×** |
+| `ConcurrentReadsOnly` | 8 | 780 µs | baseline |
+| `ConcurrentReadWrite` | 8 | 2,641 µs | **3.4×** |
 
 `ReaderWriterLockSlim` allows parallel reads; a single writer's exclusive lock blocks all readers. The penalty shrinks as reader count grows because each write-lock acquisition is amortised across more concurrent readers.
 
@@ -239,12 +284,12 @@ A MemTable hit costs **~21 ns** with zero allocation. An SSTable hit and a key m
 
 | Method | EntryCount | Mean | vs. no compaction |
 |---|---|---|---|
-| `WritesWithoutCompaction` | 500 | 5.26 ms | baseline |
-| `WritesWithCompaction` | 500 | 5.32 ms | 1.01× |
-| `WritesWithoutCompaction` | 1,000 | 10.66 ms | baseline |
-| `WritesWithCompaction` | 1,000 | 10.67 ms | 1.00× |
+| `WritesWithoutCompaction` | 500 | 5.64 ms | baseline |
+| `WritesWithCompaction` | 500 | 6.41 ms | 1.14× |
+| `WritesWithoutCompaction` | 1,000 | 13.67 ms | baseline |
+| `WritesWithCompaction` | 1,000 | 15.96 ms | 1.17× |
 
-At small data sizes the compaction overhead is not measurable — the merge of a few kilobytes of SSTable data is lost in I/O noise.
+At small data sizes the compaction overhead is modest — merging a few kilobytes of SSTable data is fast relative to the fsync cost of the WAL writes that trigger it.
 
 ### Running Benchmarks
 
