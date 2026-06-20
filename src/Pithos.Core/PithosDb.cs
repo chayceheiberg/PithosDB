@@ -20,6 +20,7 @@ public sealed class PithosDb : IDisposable
     private readonly List<List<string>> _levels = [];
     private readonly Dictionary<string, SSTableReader> _readerCache = new();
     private readonly IBlockCache? _blockCache;
+    private readonly Manifest _manifest;
     private readonly ReaderWriterLockSlim _lock = new();
 
     private MemTable _memTable = new();
@@ -45,7 +46,8 @@ public sealed class PithosDb : IDisposable
                 ? new S3FifoBlockCache(_options.BlockCacheSizeBytes)
                 : new LruBlockCache(_options.BlockCacheSizeBytes)
             : null;
-        _compactor = new LeveledCompactor(directory, _options, _readerCache, _blockCache);
+        _manifest = new Manifest(directory);
+        _compactor = new LeveledCompactor(directory, _options, _readerCache, _blockCache, _manifest);
         _wal = new WriteAheadLog(Path.Combine(directory, "wal.log"));
         RecoverFromWal();
         RecoverSSTables();
@@ -226,11 +228,11 @@ public sealed class PithosDb : IDisposable
                 pq.Enqueue((kv.Key, kv.Value, idx), (kv.Key, idx));
             }
 
-            if (isDuplicate) continue;  // older source shadowed by a newer one
-            if (value is null) continue; // tombstone
+            if (isDuplicate) continue;
+            if (value is null) continue;
 
             if (from is not null && comparer.Compare(key, from) < 0) continue;
-            if (to   is not null && comparer.Compare(key, to)   > 0) break; // sorted — done
+            if (to   is not null && comparer.Compare(key, to)   > 0) break;
 
             results.Add((key, value));
         }
@@ -255,6 +257,9 @@ public sealed class PithosDb : IDisposable
         File.Delete(Path.Combine(_directory, "wal.log"));
         _wal = new WriteAheadLog(Path.Combine(_directory, "wal.log"));
 
+        // Write manifest after the new L0 file is registered so recovery finds it.
+        _manifest.Write(_levels);
+
         _compactor.CompactIfNeeded(_levels);
     }
 
@@ -269,16 +274,47 @@ public sealed class PithosDb : IDisposable
 
     private void RecoverSSTables()
     {
-        foreach (var path in Directory.GetFiles(_directory, "*.sst").OrderBy(File.GetCreationTimeUtc))
+        if (_manifest.TryRead(out var manifestLevels))
         {
-            var name = Path.GetFileNameWithoutExtension(path);
-            var sep = name.IndexOf('_');
-            if (sep < 2 || !name.StartsWith('L')) continue;
-            if (!int.TryParse(name[1..sep], out int level)) continue;
+            // Manifest exists — use it as the authoritative level structure.
+            // Validate each file still exists (guards against crashes during deletion).
+            for (int i = 0; i < manifestLevels.Count; i++)
+            {
+                while (_levels.Count <= i) _levels.Add([]);
+                foreach (var path in manifestLevels[i])
+                {
+                    if (!File.Exists(path)) continue; // orphan from a crash; skip
+                    _levels[i].Add(path);
+                    _readerCache[path] = new SSTableReader(path, _blockCache);
+                }
+            }
 
-            while (_levels.Count <= level) _levels.Add([]);
-            _levels[level].Add(path);
-            _readerCache[path] = new SSTableReader(path, _blockCache);
+            // Remove orphaned SSTable files (on disk but not in the manifest).
+            var knownFiles = new HashSet<string>(manifestLevels.SelectMany(l => l));
+            foreach (var path in Directory.GetFiles(_directory, "*.sst"))
+            {
+                if (!knownFiles.Contains(path))
+                    File.Delete(path);
+            }
+        }
+        else
+        {
+            // No manifest — fall back to filename-based recovery for existing databases,
+            // then write a manifest for all future opens.
+            foreach (var path in Directory.GetFiles(_directory, "*.sst").OrderBy(File.GetCreationTimeUtc))
+            {
+                var name = Path.GetFileNameWithoutExtension(path);
+                var sep = name.IndexOf('_');
+                if (sep < 2 || !name.StartsWith('L')) continue;
+                if (!int.TryParse(name[1..sep], out int level)) continue;
+
+                while (_levels.Count <= level) _levels.Add([]);
+                _levels[level].Add(path);
+                _readerCache[path] = new SSTableReader(path, _blockCache);
+            }
+
+            if (_levels.Count > 0)
+                _manifest.Write(_levels);
         }
     }
 

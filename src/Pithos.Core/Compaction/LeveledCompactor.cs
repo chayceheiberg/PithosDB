@@ -16,6 +16,7 @@ public sealed class LeveledCompactor
     private readonly int[] _levelSizeLimits;
     private readonly Dictionary<string, SSTableReader> _readerCache;
     private readonly IBlockCache? _blockCache;
+    private readonly Manifest? _manifest;
 
     /// <summary>
     /// Creates a compactor for the database at <paramref name="directory"/> using
@@ -28,12 +29,19 @@ public sealed class LeveledCompactor
     /// source-file entries before deleting them and registers the merged output
     /// so reads can immediately use the cached reader.
     /// </param>
-    public LeveledCompactor(string directory, PithosOptions options, Dictionary<string, SSTableReader> readerCache, IBlockCache? blockCache = null)
+    /// <param name="blockCache">Optional shared block cache.</param>
+    /// <param name="manifest">
+    /// Optional manifest. When provided, the manifest is updated after each
+    /// compaction step before source files are deleted, ensuring crash-safe recovery.
+    /// </param>
+    public LeveledCompactor(string directory, PithosOptions options, Dictionary<string, SSTableReader> readerCache,
+        IBlockCache? blockCache = null, Manifest? manifest = null)
     {
         _directory = directory;
         _options = options;
         _readerCache = readerCache;
         _blockCache = blockCache;
+        _manifest = manifest;
         _levelSizeLimits = new int[options.LevelCount];
         int size = options.LevelZeroFileCountLimit;
         for (int i = 0; i < options.LevelCount; i++) { _levelSizeLimits[i] = size; size *= options.LevelSizeMultiplier; }
@@ -59,8 +67,13 @@ public sealed class LeveledCompactor
 
     /// <summary>
     /// Merges all SSTables at <paramref name="level"/> into a single SSTable at
-    /// <c>level + 1</c>, then deletes the source files. The output file is placed
-    /// in <c>_directory</c> with a name like <c>L{n+1}_{guid}.sst</c>.
+    /// <c>level + 1</c>, then deletes the source files.
+    /// <para>
+    /// Crash-safe ordering: the manifest is written after the merged file is
+    /// created but before source files are deleted. A crash between those two
+    /// points leaves the manifest in a consistent state; orphaned files are
+    /// cleaned up on the next open.
+    /// </para>
     /// </summary>
     private void Compact(List<List<string>> levels, int level)
     {
@@ -71,17 +84,24 @@ public sealed class LeveledCompactor
         levels[level].Clear();
 
         var readers = sources.Select(p => new SSTableReader(p)).ToList();
+        string? outPath = null;
         try
         {
             var merged = MergeEntries(readers);
-            string outPath = System.IO.Path.Combine(_directory, $"L{level + 1}_{Guid.NewGuid():N}.sst");
+            outPath = System.IO.Path.Combine(_directory, $"L{level + 1}_{Guid.NewGuid():N}.sst");
             SSTableWriter.Write(outPath, merged, _options.BloomFilterFalsePositiveRate, _options.Compression);
             levels[level + 1].Add(outPath);
             _readerCache[outPath] = new SSTableReader(outPath, _blockCache);
-        }
-        finally
-        {
+
+            // Write manifest with the new file added and sources removed, BEFORE
+            // deleting the source files. If we crash here the manifest is consistent;
+            // the stale source files become orphans and are removed on next open.
+            _manifest?.Write(levels);
+
+            // Release all file handles on source files before deleting them.
             foreach (var r in readers) r.Dispose();
+            readers.Clear();
+
             foreach (var p in sources)
             {
                 _blockCache?.EvictFile(p);
@@ -92,6 +112,26 @@ public sealed class LeveledCompactor
                 }
                 File.Delete(p);
             }
+        }
+        catch
+        {
+            // Roll back in-memory state. The outPath file (if created) is an orphan
+            // that will be removed on next open via orphan cleanup.
+            levels[level].AddRange(sources);
+            if (outPath is not null)
+            {
+                levels[level + 1].Remove(outPath);
+                if (_readerCache.TryGetValue(outPath, out var r))
+                {
+                    _readerCache.Remove(outPath);
+                    r.Dispose();
+                }
+            }
+            throw;
+        }
+        finally
+        {
+            foreach (var r in readers) r.Dispose(); // no-op if already disposed above
         }
     }
 
