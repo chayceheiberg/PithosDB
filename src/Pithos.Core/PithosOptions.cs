@@ -1,4 +1,20 @@
+using Pithos.Core.Core;
+
 namespace Pithos.Core;
+
+/// <summary>Block cache eviction policy.</summary>
+public enum BlockCacheKind
+{
+    /// <summary>Least-Recently-Used. Good general-purpose default.</summary>
+    Lru,
+    /// <summary>
+    /// S3-FIFO (Simple, Scalable SLFU with three FIFOs, SOSP 2023).
+    /// New blocks enter a small probation queue; only blocks accessed more than
+    /// once are promoted to the main queue. Provides better scan resistance than
+    /// LRU and lower per-hit overhead (no structural mutation on cache hit).
+    /// </summary>
+    S3Fifo,
+}
 
 /// <summary>
 /// Tuning options for <see cref="PithosDb"/>. All properties have sensible
@@ -40,10 +56,16 @@ public sealed class PithosOptions
 
     /// <summary>
     /// Maximum number of bytes the shared block cache may hold. Frequently-read
-    /// SSTable blocks are kept in memory and served without disk I/O until evicted
-    /// by the LRU policy. Set to 0 to disable the block cache. Default: 8 MB.
+    /// SSTable blocks are kept in memory until evicted. Set to 0 to disable.
+    /// Default: 8 MB.
     /// </summary>
     public long BlockCacheSizeBytes { get; init; } = 8 * 1024 * 1024;
+
+    /// <summary>
+    /// Eviction policy for the block cache. Default: <see cref="BlockCacheKind.Lru"/>.
+    /// Ignored when <see cref="BlockCacheSizeBytes"/> is 0.
+    /// </summary>
+    public BlockCacheKind BlockCacheKind { get; init; } = BlockCacheKind.Lru;
 
     /// <summary>Default options — equivalent to <c>new PithosOptions()</c>.</summary>
     public static readonly PithosOptions Default = new();

@@ -15,7 +15,7 @@ public sealed class LeveledCompactor
     private readonly PithosOptions _options;
     private readonly int[] _levelSizeLimits;
     private readonly Dictionary<string, SSTableReader> _readerCache;
-    private readonly BlockCache? _blockCache;
+    private readonly IBlockCache? _blockCache;
 
     /// <summary>
     /// Creates a compactor for the database at <paramref name="directory"/> using
@@ -28,7 +28,7 @@ public sealed class LeveledCompactor
     /// source-file entries before deleting them and registers the merged output
     /// so reads can immediately use the cached reader.
     /// </param>
-    public LeveledCompactor(string directory, PithosOptions options, Dictionary<string, SSTableReader> readerCache, BlockCache? blockCache = null)
+    public LeveledCompactor(string directory, PithosOptions options, Dictionary<string, SSTableReader> readerCache, IBlockCache? blockCache = null)
     {
         _directory = directory;
         _options = options;

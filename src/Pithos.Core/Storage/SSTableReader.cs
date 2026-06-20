@@ -19,7 +19,7 @@ public sealed class SSTableReader : IDisposable
     private readonly List<(byte[] firstKey, long offset)> _index;
     private readonly BloomFilter _bloom;
     private readonly long _bloomOffset;
-    private readonly BlockCache? _blockCache;
+    private readonly IBlockCache? _blockCache;
 
     /// <summary>Absolute path to the SSTable file.</summary>
     public string Path { get; }
@@ -33,7 +33,7 @@ public sealed class SSTableReader : IDisposable
     /// Optional shared block cache. When provided, block reads are served from
     /// cache on subsequent accesses to the same block.
     /// </param>
-    public SSTableReader(string path, BlockCache? blockCache = null)
+    public SSTableReader(string path, IBlockCache? blockCache = null)
     {
         Path = path;
         _blockCache = blockCache;
