@@ -89,6 +89,32 @@ public sealed class PithosOptions
     /// </summary>
     public CompressionKind Compression { get; init; } = CompressionKind.None;
 
+    /// <summary>
+    /// Enables per-entry TTL support. When <see langword="true"/>, all values are stored
+    /// with a 1-byte encoding header; <see cref="PithosDb.Put(byte[], byte[], TimeSpan)"/>
+    /// becomes available and expired entries are automatically hidden at read time and
+    /// removed during compaction.
+    /// <para>
+    /// <b>Important:</b> this option must be set consistently across all opens of the same
+    /// database. Enabling or disabling it on an existing database will corrupt reads.
+    /// Default: <see langword="false"/>.
+    /// </para>
+    /// </summary>
+    public bool EnableTtl { get; init; } = false;
+
+    /// <summary>
+    /// Optional filter applied to every live entry at read time and during compaction.
+    /// Entries for which <see cref="ICompactionFilter.ShouldKeep"/> returns
+    /// <see langword="false"/> are immediately invisible and are physically removed from
+    /// merged SSTables on the next compaction. The filter receives the decoded user value
+    /// (TTL overhead already stripped when <see cref="EnableTtl"/> is
+    /// <see langword="true"/>).
+    /// <para>
+    /// The implementation must be thread-safe. Default: <see langword="null"/> (no filter).
+    /// </para>
+    /// </summary>
+    public ICompactionFilter? CompactionFilter { get; init; } = null;
+
     /// <summary>Default options — equivalent to <c>new PithosOptions()</c>.</summary>
     public static readonly PithosOptions Default = new();
 

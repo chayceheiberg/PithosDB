@@ -17,6 +17,7 @@ public sealed class LeveledCompactor
     private readonly Dictionary<string, SSTableReader> _readerCache;
     private readonly IBlockCache? _blockCache;
     private readonly Manifest? _manifest;
+    private readonly ICompactionFilter? _filter;
 
     /// <summary>
     /// Creates a compactor for the database at <paramref name="directory"/> using
@@ -42,6 +43,7 @@ public sealed class LeveledCompactor
         _readerCache = readerCache;
         _blockCache = blockCache;
         _manifest = manifest;
+        _filter = options.CompactionFilter;
         _levelSizeLimits = new int[options.LevelCount];
         int size = options.LevelZeroFileCountLimit;
         for (int i = 0; i < options.LevelCount; i++) { _levelSizeLimits[i] = size; size *= options.LevelSizeMultiplier; }
@@ -87,7 +89,7 @@ public sealed class LeveledCompactor
         string? outPath = null;
         try
         {
-            var merged = MergeEntries(readers);
+            var merged = MergeEntries(readers, _options.EnableTtl, _filter);
             outPath = System.IO.Path.Combine(_directory, $"L{level + 1}_{Guid.NewGuid():N}.sst");
             SSTableWriter.Write(outPath, merged, _options.BloomFilterFalsePositiveRate, _options.Compression);
             levels[level + 1].Add(outPath);
@@ -142,7 +144,8 @@ public sealed class LeveledCompactor
     /// the entry from the highest-indexed reader (i.e. the newest SSTable) is
     /// emitted and all older copies are discarded.
     /// </summary>
-    private static IEnumerable<KeyValuePair<byte[], byte[]?>> MergeEntries(List<SSTableReader> readers)
+    private static IEnumerable<KeyValuePair<byte[], byte[]?>> MergeEntries(
+        List<SSTableReader> readers, bool enableTtl, ICompactionFilter? filter)
     {
         var comparer = ByteArrayComparer.Instance;
         var enumerators = readers.Select(r => r.ReadAllEntries().GetEnumerator()).ToList();
@@ -171,8 +174,30 @@ public sealed class LeveledCompactor
 
             if (lastKey is null || comparer.Compare(lastKey, key) != 0)
             {
-                yield return new KeyValuePair<byte[], byte[]?>(key, value);
                 lastKey = key;
+
+                if (value is null)
+                {
+                    // Tombstone — always pass through so it shadows older copies.
+                    yield return new KeyValuePair<byte[], byte[]?>(key, null);
+                }
+                else
+                {
+                    // Decode for TTL check and filter; re-emit original encoded bytes
+                    // so the TTL header is preserved for future reads and compactions.
+                    byte[] userValue = value;
+                    bool keep = true;
+
+                    if (enableTtl)
+                    {
+                        var (decoded, dropped) = ValueCodec.DecodeForCompaction(value);
+                        if (dropped) keep = false;
+                        else userValue = decoded!;
+                    }
+
+                    if (keep && (filter is null || filter.ShouldKeep(key, userValue)))
+                        yield return new KeyValuePair<byte[], byte[]?>(key, value);
+                }
             }
 
             if (enumerators[idx].MoveNext())

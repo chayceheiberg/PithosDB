@@ -1,4 +1,4 @@
-﻿using PithosDB.Core.Compaction;
+using PithosDB.Core.Compaction;
 using PithosDB.Core.Core;
 using PithosDB.Core.Storage;
 
@@ -61,17 +61,41 @@ public sealed class PithosDb : IDisposable
     /// </summary>
     public void Put(byte[] key, byte[] value)
     {
+        var stored = _options.EnableTtl ? ValueCodec.Encode(value) : value;
         _lock.EnterWriteLock();
         try
         {
-            _wal.AppendPut(key, value);
-            _memTable.Put(key, value);
+            _wal.AppendPut(key, stored);
+            _memTable.Put(key, stored);
             MaybeFlushMemTable();
         }
-        finally
+        finally { _lock.ExitWriteLock(); }
+    }
+
+    /// <summary>
+    /// Inserts or updates <paramref name="key"/> with <paramref name="value"/>, expiring
+    /// it after <paramref name="ttl"/> elapses. The entry becomes invisible to reads as
+    /// soon as the TTL expires and is physically removed during the next compaction.
+    /// Requires <see cref="PithosOptions.EnableTtl"/> to be <see langword="true"/>.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when <see cref="PithosOptions.EnableTtl"/> is <see langword="false"/>.
+    /// </exception>
+    public void Put(byte[] key, byte[] value, TimeSpan ttl)
+    {
+        if (!_options.EnableTtl)
+            throw new InvalidOperationException(
+                "TTL writes require PithosOptions.EnableTtl = true.");
+
+        var stored = ValueCodec.EncodeWithExpiry(value, DateTimeOffset.UtcNow.Add(ttl));
+        _lock.EnterWriteLock();
+        try
         {
-            _lock.ExitWriteLock();
+            _wal.AppendPut(key, stored);
+            _memTable.Put(key, stored);
+            MaybeFlushMemTable();
         }
+        finally { _lock.ExitWriteLock(); }
     }
 
     /// <summary>
@@ -86,18 +110,34 @@ public sealed class PithosDb : IDisposable
         _lock.EnterWriteLock();
         try
         {
-            _wal.AppendBatch(batch.Operations);
-            foreach (var (type, key, value) in batch.Operations)
+            // Encode put values at the point of entry so WAL and MemTable store the
+            // same format as individual Put calls.
+            var encoded = batch.Operations
+                .Select(op =>
+                {
+                    if (op.Type != WalEntryType.Put) return (op.Type, op.Key, op.Value);
+                    if (op.Ttl.HasValue)
+                    {
+                        if (!_options.EnableTtl)
+                            throw new InvalidOperationException(
+                                "TTL batch entries require PithosOptions.EnableTtl = true.");
+                        return (op.Type, op.Key,
+                            (byte[]?)ValueCodec.EncodeWithExpiry(op.Value!, DateTimeOffset.UtcNow.Add(op.Ttl.Value)));
+                    }
+                    return (op.Type, op.Key,
+                        (byte[]?)(_options.EnableTtl ? ValueCodec.Encode(op.Value!) : op.Value));
+                })
+                .ToList();
+
+            _wal.AppendBatch(encoded);
+            foreach (var (type, key, value) in encoded)
             {
                 if (type == WalEntryType.Put) _memTable.Put(key, value!);
                 else _memTable.Delete(key);
             }
             MaybeFlushMemTable();
         }
-        finally
-        {
-            _lock.ExitWriteLock();
-        }
+        finally { _lock.ExitWriteLock(); }
     }
 
     /// <summary>
@@ -115,56 +155,49 @@ public sealed class PithosDb : IDisposable
             _memTable.Delete(key);
             MaybeFlushMemTable();
         }
-        finally
-        {
-            _lock.ExitWriteLock();
-        }
+        finally { _lock.ExitWriteLock(); }
     }
 
     /// <summary>
     /// Looks up <paramref name="key"/>, searching the MemTable first, then each
     /// SSTable level from newest to oldest. Returns <see langword="false"/> if
-    /// the key does not exist or has been deleted. Multiple threads may call
+    /// the key does not exist, has been deleted, has expired (TTL), or is filtered
+    /// by <see cref="PithosOptions.CompactionFilter"/>. Multiple threads may call
     /// <see cref="TryGet"/> concurrently.
     /// </summary>
-    /// <param name="key">The key to look up.</param>
-    /// <param name="value">
-    /// Set to the stored value on success, or <see langword="null"/> on failure.
-    /// </param>
-    /// <returns>
-    /// <see langword="true"/> if the key exists and has not been deleted;
-    /// <see langword="false"/> otherwise.
-    /// </returns>
     public bool TryGet(byte[] key, out byte[]? value)
     {
         _lock.EnterReadLock();
         try
         {
-            if (_memTable.TryGet(key, out value))
-                return value is not null;
+            byte[]? raw;
+            if (_memTable.TryGet(key, out raw))
+            {
+                if (raw is null) { value = null; return false; } // tombstone
+                return DecodeAndFilter(key, raw, out value);
+            }
 
             foreach (var level in _levels)
+            foreach (var sstPath in Enumerable.Reverse(level))
             {
-                foreach (var sstPath in Enumerable.Reverse(level))
+                if (_readerCache[sstPath].TryGet(key, out raw))
                 {
-                    if (_readerCache[sstPath].TryGet(key, out value))
-                        return value is not null;
+                    if (raw is null) { value = null; return false; } // tombstone
+                    return DecodeAndFilter(key, raw, out value);
                 }
             }
 
             value = null;
             return false;
         }
-        finally
-        {
-            _lock.ExitReadLock();
-        }
+        finally { _lock.ExitReadLock(); }
     }
 
     /// <summary>
     /// Returns all live key-value pairs whose keys fall within the inclusive range
     /// [<paramref name="from"/>, <paramref name="to"/>], in sorted order. Omit either
-    /// bound for an open-ended scan; omit both for a full scan.
+    /// bound for an open-ended scan; omit both for a full scan. Expired and filtered
+    /// entries are excluded.
     /// </summary>
     public IEnumerable<(byte[] key, byte[] value)> Scan(byte[]? from = null, byte[]? to = null)
     {
@@ -173,18 +206,35 @@ public sealed class PithosDb : IDisposable
         {
             return CollectScan(from, to);
         }
-        finally
+        finally { _lock.ExitReadLock(); }
+    }
+
+    // Strips the TTL header (when EnableTtl), checks expiry, and applies the
+    // compaction filter. Returns false if the entry should be hidden from the caller.
+    private bool DecodeAndFilter(byte[] key, byte[] raw, out byte[]? value)
+    {
+        if (_options.EnableTtl)
         {
-            _lock.ExitReadLock();
+            value = ValueCodec.Decode(raw);
+            if (value is null) return false; // expired
         }
+        else
+        {
+            value = raw;
+        }
+
+        if (_options.CompactionFilter?.ShouldKeep(key, value) == false)
+        {
+            value = null;
+            return false;
+        }
+        return true;
     }
 
     private List<(byte[] key, byte[] value)> CollectScan(byte[]? from, byte[]? to)
     {
         var comparer = ByteArrayComparer.Instance;
 
-        // Build source list ordered newest → oldest: MemTable first, then each
-        // level's files in reverse (most recently flushed file = newest within level).
         var sources = new List<IEnumerable<KeyValuePair<byte[], byte[]?>>>
         {
             _memTable.GetSortedEntries()
@@ -193,8 +243,6 @@ public sealed class PithosDb : IDisposable
             foreach (var path in Enumerable.Reverse(level))
                 sources.Add(_readerCache[path].ReadAllEntries());
 
-        // k-way merge across all sorted sources. On key collision, the source with
-        // the lower index wins (lower index = newer). Priority: key asc, then idx asc.
         var pq = new PriorityQueue<(byte[] key, byte[]? value, int src), (byte[], int)>(
             Comparer<(byte[], int)>.Create((a, b) =>
             {
@@ -229,12 +277,27 @@ public sealed class PithosDb : IDisposable
             }
 
             if (isDuplicate) continue;
-            if (value is null) continue;
+            if (value is null) continue; // tombstone
+
+            // Decode TTL wrapper and check expiry.
+            byte[] userValue;
+            if (_options.EnableTtl)
+            {
+                var decoded = ValueCodec.Decode(value);
+                if (decoded is null) continue; // expired
+                userValue = decoded;
+            }
+            else
+            {
+                userValue = value;
+            }
+
+            if (_options.CompactionFilter?.ShouldKeep(key, userValue) == false) continue;
 
             if (from is not null && comparer.Compare(key, from) < 0) continue;
             if (to   is not null && comparer.Compare(key, to)   > 0) break;
 
-            results.Add((key, value));
+            results.Add((key, userValue));
         }
 
         foreach (var e in enumerators) e.Dispose();
@@ -257,9 +320,7 @@ public sealed class PithosDb : IDisposable
         File.Delete(Path.Combine(_directory, "wal.log"));
         _wal = new WriteAheadLog(Path.Combine(_directory, "wal.log"));
 
-        // Write manifest after the new L0 file is registered so recovery finds it.
         _manifest.Write(_levels);
-
         _compactor.CompactIfNeeded(_levels);
     }
 
@@ -276,20 +337,17 @@ public sealed class PithosDb : IDisposable
     {
         if (_manifest.TryRead(out var manifestLevels))
         {
-            // Manifest exists — use it as the authoritative level structure.
-            // Validate each file still exists (guards against crashes during deletion).
             for (int i = 0; i < manifestLevels.Count; i++)
             {
                 while (_levels.Count <= i) _levels.Add([]);
                 foreach (var path in manifestLevels[i])
                 {
-                    if (!File.Exists(path)) continue; // orphan from a crash; skip
+                    if (!File.Exists(path)) continue;
                     _levels[i].Add(path);
                     _readerCache[path] = new SSTableReader(path, _blockCache);
                 }
             }
 
-            // Remove orphaned SSTable files (on disk but not in the manifest).
             var knownFiles = new HashSet<string>(manifestLevels.SelectMany(l => l));
             foreach (var path in Directory.GetFiles(_directory, "*.sst"))
             {
@@ -299,8 +357,6 @@ public sealed class PithosDb : IDisposable
         }
         else
         {
-            // No manifest — fall back to filename-based recovery for existing databases,
-            // then write a manifest for all future opens.
             foreach (var path in Directory.GetFiles(_directory, "*.sst").OrderBy(File.GetCreationTimeUtc))
             {
                 var name = Path.GetFileNameWithoutExtension(path);

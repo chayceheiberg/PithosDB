@@ -11,7 +11,7 @@ string dbPath = args[0];
 
 PrintBanner(dbPath);
 
-using var db = new PithosDb(dbPath);
+using var db = new PithosDb(dbPath, new PithosOptions { EnableTtl = true });
 
 while (true)
 {
@@ -29,14 +29,23 @@ while (true)
     {
         case "put":
         {
-            var (key, value) = Split(rest);
+            var (key, rest2) = Split(rest);
+            var (value, ttlStr) = Split(rest2);
             if (key.Length == 0 || value.Length == 0)
             {
-                Err("Usage: put <key> <value>");
+                Err("Usage: put <key> <value> [ttl-seconds]");
                 break;
             }
-            db.Put(Encode(key), Encode(value));
-            Console.WriteLine("OK");
+            if (ttlStr.Length > 0 && double.TryParse(ttlStr, out double secs))
+            {
+                db.Put(Encode(key), Encode(value), TimeSpan.FromSeconds(secs));
+                Console.WriteLine($"OK (expires in {secs}s)");
+            }
+            else
+            {
+                db.Put(Encode(key), Encode(value));
+                Console.WriteLine("OK");
+            }
             break;
         }
 
@@ -79,12 +88,12 @@ while (true)
         case "help":
             Console.WriteLine("""
                 Commands:
-                  put <key> <value>       Insert or update a key
-                  get <key>               Retrieve a value
-                  delete <key>            Delete a key
-                  scan [<from> [<to>]]    List entries in key range (bounds inclusive, omit for full scan)
-                  help                    Show this message
-                  exit                    Quit
+                  put <key> <value> [ttl-seconds]   Insert or update a key (optional TTL)
+                  get <key>                         Retrieve a value
+                  delete <key>                      Delete a key
+                  scan [<from> [<to>]]              List entries in key range (inclusive, omit for full scan)
+                  help                              Show this message
+                  exit                              Quit
                 """);
             break;
 
