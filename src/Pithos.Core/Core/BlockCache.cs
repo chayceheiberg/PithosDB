@@ -7,7 +7,7 @@ namespace Pithos.Core.Core;
 /// instances. Caches raw block bytes keyed by (file path, block offset) so hot blocks
 /// are served from memory rather than re-read from disk on every lookup.
 /// </summary>
-public sealed class BlockCache
+public sealed class BlockCache : IBlockCache
 {
     private sealed class Entry
     {

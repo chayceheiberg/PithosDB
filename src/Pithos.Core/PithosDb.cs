@@ -19,7 +19,7 @@ public sealed class PithosDb : IDisposable
     private readonly LeveledCompactor _compactor;
     private readonly List<List<string>> _levels = [];
     private readonly Dictionary<string, SSTableReader> _readerCache = new();
-    private readonly BlockCache? _blockCache;
+    private readonly IBlockCache? _blockCache;
     private readonly ReaderWriterLockSlim _lock = new();
 
     private MemTable _memTable = new();
@@ -40,7 +40,11 @@ public sealed class PithosDb : IDisposable
         _options.Validate();
         _directory = directory;
         Directory.CreateDirectory(directory);
-        _blockCache = _options.BlockCacheSizeBytes > 0 ? new BlockCache(_options.BlockCacheSizeBytes) : null;
+        _blockCache = _options.BlockCacheSizeBytes > 0
+            ? _options.BlockCacheKind == BlockCacheKind.S3Fifo
+                ? new S3FifoBlockCache(_options.BlockCacheSizeBytes)
+                : new BlockCache(_options.BlockCacheSizeBytes)
+            : null;
         _compactor = new LeveledCompactor(directory, _options, _readerCache, _blockCache);
         _wal = new WriteAheadLog(Path.Combine(directory, "wal.log"));
         RecoverFromWal();
