@@ -159,6 +159,86 @@ public sealed class PithosDb : IDisposable
         }
     }
 
+    /// <summary>
+    /// Returns all live key-value pairs whose keys fall within the inclusive range
+    /// [<paramref name="from"/>, <paramref name="to"/>], in sorted order. Omit either
+    /// bound for an open-ended scan; omit both for a full scan.
+    /// </summary>
+    public IEnumerable<(byte[] key, byte[] value)> Scan(byte[]? from = null, byte[]? to = null)
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            return CollectScan(from, to);
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+    }
+
+    private List<(byte[] key, byte[] value)> CollectScan(byte[]? from, byte[]? to)
+    {
+        var comparer = ByteArrayComparer.Instance;
+
+        // Build source list ordered newest → oldest: MemTable first, then each
+        // level's files in reverse (most recently flushed file = newest within level).
+        var sources = new List<IEnumerable<KeyValuePair<byte[], byte[]?>>>
+        {
+            _memTable.GetSortedEntries()
+        };
+        foreach (var level in _levels)
+            foreach (var path in Enumerable.Reverse(level))
+                sources.Add(_readerCache[path].ReadAllEntries());
+
+        // k-way merge across all sorted sources. On key collision, the source with
+        // the lower index wins (lower index = newer). Priority: key asc, then idx asc.
+        var pq = new PriorityQueue<(byte[] key, byte[]? value, int src), (byte[], int)>(
+            Comparer<(byte[], int)>.Create((a, b) =>
+            {
+                int c = comparer.Compare(a.Item1, b.Item1);
+                return c != 0 ? c : a.Item2.CompareTo(b.Item2);
+            }));
+
+        var enumerators = sources.Select(s => s.GetEnumerator()).ToList();
+        for (int i = 0; i < enumerators.Count; i++)
+        {
+            if (enumerators[i].MoveNext())
+            {
+                var kv = enumerators[i].Current;
+                pq.Enqueue((kv.Key, kv.Value, i), (kv.Key, i));
+            }
+        }
+
+        var results = new List<(byte[] key, byte[] value)>();
+        byte[]? lastKey = null;
+
+        while (pq.Count > 0)
+        {
+            var (key, value, idx) = pq.Dequeue();
+
+            bool isDuplicate = lastKey is not null && comparer.Compare(lastKey, key) == 0;
+            lastKey = key;
+
+            if (enumerators[idx].MoveNext())
+            {
+                var kv = enumerators[idx].Current;
+                pq.Enqueue((kv.Key, kv.Value, idx), (kv.Key, idx));
+            }
+
+            if (isDuplicate) continue;  // older source shadowed by a newer one
+            if (value is null) continue; // tombstone
+
+            if (from is not null && comparer.Compare(key, from) < 0) continue;
+            if (to   is not null && comparer.Compare(key, to)   > 0) break; // sorted — done
+
+            results.Add((key, value));
+        }
+
+        foreach (var e in enumerators) e.Dispose();
+        return results;
+    }
+
     private void MaybeFlushMemTable()
     {
         if (_memTable.SizeBytes < _options.MemTableSizeThreshold) return;
