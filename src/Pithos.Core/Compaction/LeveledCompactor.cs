@@ -45,8 +45,13 @@ public sealed class LeveledCompactor
     /// </summary>
     public void CompactIfNeeded(List<List<string>> levels)
     {
-        for (int level = 0; level < levels.Count - 1; level++)
+        // Iterate all compactable levels (0 to LevelCount-2). Stop early if the
+        // level doesn't exist yet — levels are created sequentially so higher
+        // levels can't exist if a lower one is absent. Compact() creates the
+        // destination level on demand, so we don't need it to exist up front.
+        for (int level = 0; level < _levelSizeLimits.Length - 1; level++)
         {
+            if (level >= levels.Count) break;
             if (levels[level].Count >= _levelSizeLimits[level])
                 Compact(levels, level);
         }
