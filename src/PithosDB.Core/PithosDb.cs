@@ -229,6 +229,45 @@ public sealed class PithosDb : IDisposable
         finally { _lock.ExitReadLock(); }
     }
 
+    /// <summary>
+    /// Returns an approximate count of live keys in the inclusive range
+    /// [<paramref name="from"/>, <paramref name="to"/>]. Omit either bound for an
+    /// open-ended range; omit both for the full database.
+    /// <para>
+    /// The count is exact for keys in the MemTable and a block-level approximation
+    /// for keys in SSTables — each SSTable block that overlaps the range contributes
+    /// one unit regardless of how many keys it contains. The result may overcount
+    /// when the same key exists in both the MemTable and an SSTable (before the next
+    /// compaction), and does not reflect tombstones that shadow SSTable values.
+    /// Use this for query planning and informational stats, not for exact counts.
+    /// </para>
+    /// </summary>
+    public long ApproximateCount(byte[]? from = null, byte[]? to = null)
+    {
+        var cmp = ByteArrayComparer.Instance;
+        _lock.EnterReadLock();
+        try
+        {
+            long count = 0;
+
+            // Exact live count from the MemTable.
+            foreach (var kv in _memTable.GetSortedEntries())
+            {
+                if (from != null && cmp.Compare(kv.Key, from) < 0) continue;
+                if (to   != null && cmp.Compare(kv.Key, to)   > 0) break;
+                if (kv.Value != null) count++; // skip tombstones
+            }
+
+            // Block-level approximation from SSTables across all levels.
+            foreach (var level in _levels)
+                foreach (var path in level)
+                    count += _readerCache[path].ApproximateKeyCount(from, to);
+
+            return count;
+        }
+        finally { _lock.ExitReadLock(); }
+    }
+
     // Strips the TTL header (when EnableTtl), checks expiry, and applies the
     // compaction filter. Returns false if the entry should be hidden from the caller.
     private bool DecodeAndFilter(byte[] key, byte[] raw, out byte[]? value)

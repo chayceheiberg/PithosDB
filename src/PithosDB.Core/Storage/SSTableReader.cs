@@ -233,6 +233,32 @@ public sealed class SSTableReader : IDisposable
     }
 
     /// <summary>
+    /// Returns the number of SSTable blocks whose key range overlaps
+    /// [<paramref name="from"/>, <paramref name="to"/>]. Each block holds
+    /// approximately one block's worth of keys; callers should treat this as a
+    /// rough order-of-magnitude estimate rather than an exact count. Omit either
+    /// bound for an open-ended range.
+    /// </summary>
+    public int ApproximateKeyCount(byte[]? from, byte[]? to)
+    {
+        var cmp = ByteArrayComparer.Instance;
+        int count = 0;
+        for (int i = 0; i < _index.Count; i++)
+        {
+            var blockStart = _index[i].firstKey;
+            // Next block's first key is the exclusive upper bound for block i.
+            var blockEnd = i + 1 < _index.Count ? _index[i + 1].firstKey : null;
+
+            // Block overlaps [from, to] when blockStart <= to AND blockEnd > from.
+            bool beforeTo = to  == null || cmp.Compare(blockStart, to)  <= 0;
+            bool afterFrom = from == null || blockEnd == null || cmp.Compare(blockEnd, from) > 0;
+
+            if (beforeTo && afterFrom) count++;
+        }
+        return count;
+    }
+
+    /// <summary>
     /// Binary-searches the sparse index for the last block whose first key is
     /// ≤ <paramref name="key"/>. Returns <c>(-1, -1)</c> if the key precedes the
     /// first block. The <c>end</c> value is the exclusive byte offset of the block's
