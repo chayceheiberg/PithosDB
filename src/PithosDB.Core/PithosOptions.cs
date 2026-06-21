@@ -2,6 +2,32 @@
 
 namespace PithosDB.Core;
 
+/// <summary>
+/// Controls when the WAL is flushed to the OS write buffer after each write.
+/// </summary>
+public enum WalSyncMode
+{
+    /// <summary>
+    /// Flush to the OS write buffer after every WAL record (default). Protects
+    /// against .NET process crash; data is safe as soon as the write returns.
+    /// </summary>
+    Full,
+
+    /// <summary>
+    /// Flush on a background timer every <see cref="PithosOptions.WalSyncIntervalMs"/>
+    /// milliseconds. A process crash can lose at most one interval's worth of writes.
+    /// Substantially higher write throughput for workloads with many small writes.
+    /// </summary>
+    Periodic,
+
+    /// <summary>
+    /// Never flush explicitly; the OS decides when to write buffered data to disk.
+    /// Maximum throughput; a process or OS crash may lose an unbounded number of
+    /// recent writes. Appropriate for caches or ephemeral data.
+    /// </summary>
+    None,
+}
+
 /// <summary>SSTable block compression algorithm.</summary>
 public enum CompressionKind
 {
@@ -116,6 +142,19 @@ public sealed class PithosOptions
     public ICompactionFilter? CompactionFilter { get; init; } = null;
 
     /// <summary>
+    /// Controls when WAL records are flushed to the OS write buffer.
+    /// Default: <see cref="WalSyncMode.Full"/> (flush after every write).
+    /// Ignored when <see cref="InMemory"/> is <see langword="true"/>.
+    /// </summary>
+    public WalSyncMode WalSyncMode { get; init; } = WalSyncMode.Full;
+
+    /// <summary>
+    /// Flush interval in milliseconds used when <see cref="WalSyncMode"/> is
+    /// <see cref="WalSyncMode.Periodic"/>. Must be greater than zero. Default: 200 ms.
+    /// </summary>
+    public int WalSyncIntervalMs { get; init; } = 200;
+
+    /// <summary>
     /// When <see langword="true"/>, all data lives exclusively in memory. No WAL is written,
     /// no SSTables are flushed to disk, and no state is recovered on open. Data is lost when
     /// the instance is disposed. Useful for testing, caching, and ephemeral workloads.
@@ -149,5 +188,8 @@ public sealed class PithosOptions
 
         if (BlockCacheSizeBytes < 0)
             throw new ArgumentOutOfRangeException(nameof(BlockCacheSizeBytes), "Must be zero or greater.");
+
+        if (WalSyncMode == WalSyncMode.Periodic && WalSyncIntervalMs <= 0)
+            throw new ArgumentOutOfRangeException(nameof(WalSyncIntervalMs), "Must be greater than zero when WalSyncMode is Periodic.");
     }
 }

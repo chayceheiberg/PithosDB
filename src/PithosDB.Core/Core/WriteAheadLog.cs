@@ -9,9 +9,10 @@ public enum WalEntryType : byte { Put = 1, Delete = 2, Batch = 3 }
 /// <summary>
 /// Append-only binary log that provides crash durability for unflushed MemTable writes.
 /// Every <see cref="AppendPut"/>, <see cref="AppendDelete"/>, and <see cref="AppendBatch"/>
-/// is fsynced to disk before the corresponding MemTable mutation is applied. On startup,
-/// <see cref="Replay"/> re-applies all records to rebuild the MemTable. The log file is
-/// deleted and recreated after each successful MemTable flush to SSTable.
+/// is written before the corresponding MemTable mutation is applied. Flush behavior is
+/// controlled by <see cref="WalSyncMode"/>. On startup, <see cref="Replay"/> re-applies
+/// all records to rebuild the MemTable. The log file is deleted and recreated after each
+/// successful MemTable flush to SSTable.
 /// <para>
 /// Record formats (all multi-byte integers are little-endian):
 /// <list type="bullet">
@@ -28,14 +29,32 @@ public sealed class WriteAheadLog : IDisposable
 {
     private readonly FileStream _stream;
     private readonly BinaryWriter _writer;
+    private readonly WalSyncMode _syncMode;
+    private readonly Timer? _syncTimer;
 
     /// <summary>
     /// Opens or creates the WAL file at <paramref name="path"/> in append mode.
     /// </summary>
-    public WriteAheadLog(string path)
+    /// <param name="path">Path to the WAL file.</param>
+    /// <param name="syncMode">
+    /// Controls when data is flushed to the OS write buffer.
+    /// <see cref="WalSyncMode.Full"/> (default) flushes after every record.
+    /// <see cref="WalSyncMode.Periodic"/> flushes on a background timer.
+    /// <see cref="WalSyncMode.None"/> never flushes explicitly.
+    /// </param>
+    /// <param name="syncIntervalMs">
+    /// Background flush interval in milliseconds. Only used when
+    /// <paramref name="syncMode"/> is <see cref="WalSyncMode.Periodic"/>.
+    /// </param>
+    public WriteAheadLog(string path, WalSyncMode syncMode = WalSyncMode.Full, int syncIntervalMs = 200)
     {
+        _syncMode = syncMode;
         _stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
         _writer = new BinaryWriter(_stream);
+
+        if (syncMode == WalSyncMode.Periodic)
+            _syncTimer = new Timer(_ => { try { _stream.Flush(); } catch { } },
+                null, syncIntervalMs, syncIntervalMs);
     }
 
     /// <summary>
@@ -102,7 +121,7 @@ public sealed class WriteAheadLog : IDisposable
         _writer.Write((int)ms.Length);
         _writer.Write(payload);
         _writer.Write(Crc32.HashToUInt32(payload));
-        _stream.Flush();
+        if (_syncMode == WalSyncMode.Full) _stream.Flush();
     }
 
     private void WriteRecordWithCrc(MemoryStream ms)
@@ -110,7 +129,7 @@ public sealed class WriteAheadLog : IDisposable
         var record = ms.GetBuffer().AsSpan(0, (int)ms.Length);
         _writer.Write(record);
         _writer.Write(Crc32.HashToUInt32(record));
-        _stream.Flush();
+        if (_syncMode == WalSyncMode.Full) _stream.Flush();
     }
 
     /// <summary>
@@ -206,6 +225,10 @@ public sealed class WriteAheadLog : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
+        // Stop the periodic timer before flushing so it doesn't race with Dispose.
+        _syncTimer?.Dispose();
+        // Final flush ensures any buffered writes reach the OS before we close.
+        _stream.Flush();
         _writer.Dispose();
         _stream.Dispose();
     }
