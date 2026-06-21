@@ -14,6 +14,8 @@
 
 A persistent, embedded key-value storage engine built on an [LSM-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree) architecture. Written in C# targeting .NET 9.
 
+**Docs:** [Architecture](docs/architecture.md) · [Storage Format](docs/storage-format.md)
+
 ---
 
 ## Architecture
