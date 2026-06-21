@@ -179,6 +179,29 @@ public sealed class PithosDb : IDisposable
     }
 
     /// <summary>
+    /// Deletes all live keys in the inclusive range [<paramref name="from"/>,
+    /// <paramref name="to"/>] by writing tombstones in a single atomic
+    /// <see cref="WriteBatch"/>. Omit either bound for an open-ended range;
+    /// omit both to delete every key in the database. Keys inserted concurrently
+    /// between the scan and the batch write are not affected.
+    /// </summary>
+    public void DeleteRange(byte[]? from = null, byte[]? to = null)
+    {
+        // Phase 1: collect keys under a read lock so the scan doesn't block writers.
+        _lock.EnterReadLock();
+        List<byte[]> keys;
+        try { keys = CollectScan(from, to).Select(e => e.key).ToList(); }
+        finally { _lock.ExitReadLock(); }
+
+        if (keys.Count == 0) return;
+
+        // Phase 2: write all tombstones atomically.
+        var batch = new WriteBatch();
+        foreach (var key in keys) batch.Delete(key);
+        Write(batch);
+    }
+
+    /// <summary>
     /// Looks up <paramref name="key"/>, searching the MemTable first, then each
     /// SSTable level from newest to oldest. Returns <see langword="false"/> if
     /// the key does not exist, has been deleted, has expired (TTL), or is filtered
@@ -517,6 +540,13 @@ public sealed class PithosDb : IDisposable
     /// </summary>
     public Task DeleteAsync(byte[] key, CancellationToken cancellationToken = default)
         => Task.Run(() => Delete(key), cancellationToken);
+
+    /// <summary>
+    /// Asynchronously deletes all live keys in the inclusive range
+    /// [<paramref name="from"/>, <paramref name="to"/>].
+    /// </summary>
+    public Task DeleteRangeAsync(byte[]? from = null, byte[]? to = null, CancellationToken cancellationToken = default)
+        => Task.Run(() => DeleteRange(from, to), cancellationToken);
 
     /// <summary>
     /// Asynchronously applies all operations in <paramref name="batch"/> atomically.
