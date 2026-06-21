@@ -291,6 +291,44 @@ public sealed class PithosDb : IDisposable
         finally { _lock.ExitReadLock(); }
     }
 
+    /// <summary>
+    /// Returns all live key-value pairs whose keys begin with <paramref name="prefix"/>,
+    /// in sorted order. An empty prefix matches every key (equivalent to a full scan).
+    /// Expired and filtered entries are excluded.
+    /// </summary>
+    public IEnumerable<(byte[] key, byte[] value)> ScanPrefix(byte[] prefix)
+    {
+        if (prefix.Length == 0) return Scan();
+
+        byte[]? upper = ComputePrefixUpperBound(prefix);
+
+        _lock.EnterReadLock();
+        try
+        {
+            return CollectScan(prefix, upper)
+                .Where(e => e.key.AsSpan().StartsWith(prefix));
+        }
+        finally { _lock.ExitReadLock(); }
+    }
+
+    // Returns the smallest key that is lexicographically greater than every key
+    // starting with 'prefix', used as the inclusive upper bound for a prefix scan.
+    // Increments the rightmost non-0xFF byte and truncates everything after it.
+    // Returns null when all bytes are 0xFF (prefix spans the entire key space).
+    private static byte[]? ComputePrefixUpperBound(byte[] prefix)
+    {
+        for (int i = prefix.Length - 1; i >= 0; i--)
+        {
+            if (prefix[i] < 0xFF)
+            {
+                var upper = prefix[0..(i + 1)];
+                upper[i]++;
+                return upper;
+            }
+        }
+        return null; // all bytes are 0xFF — no upper bound exists
+    }
+
     // Strips the TTL header (when EnableTtl), checks expiry, and applies the
     // compaction filter. Returns false if the entry should be hidden from the caller.
     private bool DecodeAndFilter(byte[] key, byte[] raw, out byte[]? value)
@@ -553,6 +591,23 @@ public sealed class PithosDb : IDisposable
     /// </summary>
     public Task WriteAsync(WriteBatch batch, CancellationToken cancellationToken = default)
         => Task.Run(() => Write(batch), cancellationToken);
+
+    /// <summary>
+    /// Asynchronously returns all live key-value pairs whose keys begin with
+    /// <paramref name="prefix"/>, in sorted order.
+    /// </summary>
+    public async IAsyncEnumerable<(byte[] key, byte[] value)> ScanPrefixAsync(
+        byte[] prefix,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var results = await Task.Run(() => ScanPrefix(prefix).ToList(), cancellationToken)
+                                .ConfigureAwait(false);
+        foreach (var entry in results)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return entry;
+        }
+    }
 
     /// <summary>
     /// Asynchronously streams all live key-value pairs whose keys fall within the
