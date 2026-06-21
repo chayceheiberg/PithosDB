@@ -297,6 +297,20 @@ public sealed class PithosDb : IDisposable
     }
 
     /// <summary>
+    /// Returns <see langword="true"/> if <paramref name="key"/> exists and has not been
+    /// deleted, expired, or excluded by <see cref="PithosOptions.CompactionFilter"/>.
+    /// Equivalent to <see cref="TryGet"/> without materialising the value — useful when
+    /// only key presence needs to be confirmed.
+    /// </summary>
+    public bool KeyExists(byte[] key) => TryGet(key, out _);
+
+    /// <summary>
+    /// Asynchronously returns <see langword="true"/> if <paramref name="key"/> exists.
+    /// </summary>
+    public Task<bool> KeyExistsAsync(byte[] key, CancellationToken cancellationToken = default)
+        => Task.Run(() => KeyExists(key), cancellationToken);
+
+    /// <summary>
     /// Returns all live key-value pairs whose keys fall within the inclusive range
     /// [<paramref name="from"/>, <paramref name="to"/>], in sorted order. Omit either
     /// bound for an open-ended scan; omit both for a full scan. Expired and filtered
