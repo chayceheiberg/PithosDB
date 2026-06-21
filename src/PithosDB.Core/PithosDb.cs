@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using PithosDB.Core.Compaction;
 using PithosDB.Core.Core;
 using PithosDB.Core.Storage;
@@ -371,6 +372,66 @@ public sealed class PithosDb : IDisposable
 
             if (_levels.Count > 0)
                 _manifest.Write(_levels);
+        }
+    }
+
+    // ── Async API ──────────────────────────────────────────────────────────────
+    //
+    // ReaderWriterLockSlim has thread affinity and cannot span an await, so each
+    // async method offloads its synchronous counterpart to the thread pool via
+    // Task.Run. This frees the caller's thread while WAL fsyncs and SSTable reads
+    // are in progress — the primary value for ASP.NET and other async-first hosts.
+
+    /// <summary>
+    /// Asynchronously inserts or updates <paramref name="key"/> with <paramref name="value"/>.
+    /// </summary>
+    public Task PutAsync(byte[] key, byte[] value, CancellationToken cancellationToken = default)
+        => Task.Run(() => Put(key, value), cancellationToken);
+
+    /// <summary>
+    /// Asynchronously inserts or updates <paramref name="key"/> with <paramref name="value"/>,
+    /// expiring after <paramref name="ttl"/> elapses.
+    /// Requires <see cref="PithosOptions.EnableTtl"/> to be <see langword="true"/>.
+    /// </summary>
+    public Task PutAsync(byte[] key, byte[] value, TimeSpan ttl, CancellationToken cancellationToken = default)
+        => Task.Run(() => Put(key, value, ttl), cancellationToken);
+
+    /// <summary>
+    /// Asynchronously looks up <paramref name="key"/>. Returns the value, or
+    /// <see langword="null"/> if the key does not exist, has been deleted, has expired,
+    /// or is excluded by the compaction filter.
+    /// </summary>
+    public Task<byte[]?> GetAsync(byte[] key, CancellationToken cancellationToken = default)
+        => Task.Run<byte[]?>(() => TryGet(key, out var v) ? v : null, cancellationToken);
+
+    /// <summary>
+    /// Asynchronously deletes <paramref name="key"/> by writing a tombstone.
+    /// </summary>
+    public Task DeleteAsync(byte[] key, CancellationToken cancellationToken = default)
+        => Task.Run(() => Delete(key), cancellationToken);
+
+    /// <summary>
+    /// Asynchronously applies all operations in <paramref name="batch"/> atomically.
+    /// </summary>
+    public Task WriteAsync(WriteBatch batch, CancellationToken cancellationToken = default)
+        => Task.Run(() => Write(batch), cancellationToken);
+
+    /// <summary>
+    /// Asynchronously streams all live key-value pairs whose keys fall within the
+    /// inclusive range [<paramref name="from"/>, <paramref name="to"/>], in sorted order.
+    /// Omit either bound for an open-ended scan; omit both for a full scan.
+    /// </summary>
+    public async IAsyncEnumerable<(byte[] key, byte[] value)> ScanAsync(
+        byte[]? from = null,
+        byte[]? to = null,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var results = await Task.Run(() => Scan(from, to).ToList(), cancellationToken)
+                                .ConfigureAwait(false);
+        foreach (var entry in results)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return entry;
         }
     }
 
