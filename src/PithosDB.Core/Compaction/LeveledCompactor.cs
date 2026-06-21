@@ -18,6 +18,7 @@ public sealed class LeveledCompactor
     private readonly IBlockCache? _blockCache;
     private readonly Manifest? _manifest;
     private readonly ICompactionFilter? _filter;
+    private readonly ReaderWriterLockSlim _dbLock;
 
     /// <summary>
     /// Creates a compactor for the database at <paramref name="directory"/> using
@@ -35,8 +36,13 @@ public sealed class LeveledCompactor
     /// Optional manifest. When provided, the manifest is updated after each
     /// compaction step before source files are deleted, ensuring crash-safe recovery.
     /// </param>
+    /// <param name="dbLock">
+    /// The database's <see cref="ReaderWriterLockSlim"/>. The compactor acquires the
+    /// write lock only briefly (to swap level state), keeping reads unblocked during
+    /// the expensive I/O phase.
+    /// </param>
     public LeveledCompactor(string directory, PithosOptions options, Dictionary<string, SSTableReader> readerCache,
-        IBlockCache? blockCache = null, Manifest? manifest = null)
+        IBlockCache? blockCache = null, Manifest? manifest = null, ReaderWriterLockSlim? dbLock = null)
     {
         _directory = directory;
         _options = options;
@@ -44,96 +50,135 @@ public sealed class LeveledCompactor
         _blockCache = blockCache;
         _manifest = manifest;
         _filter = options.CompactionFilter;
+        _dbLock = dbLock ?? new ReaderWriterLockSlim();
         _levelSizeLimits = new int[options.LevelCount];
         int size = options.LevelZeroFileCountLimit;
         for (int i = 0; i < options.LevelCount; i++) { _levelSizeLimits[i] = size; size *= options.LevelSizeMultiplier; }
     }
 
     /// <summary>
-    /// Checks each level and triggers a compaction cascade for any level that has
-    /// reached its file-count limit. Called after every MemTable flush.
+    /// Checks each level and triggers a compaction for any level that has reached
+    /// its file-count limit. Returns <see langword="true"/> if any compaction was
+    /// performed so callers can loop until all levels are within their limits.
+    /// Designed to be called from a background thread: expensive I/O runs without
+    /// holding <see cref="_dbLock"/>; the write lock is acquired only briefly to
+    /// swap level state before and after the I/O phase.
     /// </summary>
-    public void CompactIfNeeded(List<List<string>> levels)
+    public bool CompactIfNeeded(List<List<string>> levels)
     {
-        // Iterate all compactable levels (0 to LevelCount-2). Stop early if the
-        // level doesn't exist yet — levels are created sequentially so higher
-        // levels can't exist if a lower one is absent. Compact() creates the
-        // destination level on demand, so we don't need it to exist up front.
+        bool didWork = false;
         for (int level = 0; level < _levelSizeLimits.Length - 1; level++)
         {
-            if (level >= levels.Count) break;
-            if (levels[level].Count >= _levelSizeLimits[level])
-                Compact(levels, level);
+            bool needs;
+            _dbLock.EnterReadLock();
+            try { needs = level < levels.Count && levels[level].Count >= _levelSizeLimits[level]; }
+            finally { _dbLock.ExitReadLock(); }
+
+            if (needs) { Compact(levels, level); didWork = true; }
         }
+        return didWork;
     }
 
     /// <summary>
     /// Merges all SSTables at <paramref name="level"/> into a single SSTable at
     /// <c>level + 1</c>, then deletes the source files.
     /// <para>
+    /// Locking: the write lock is held only during the two brief state-swap steps
+    /// (snapshotting sources and committing the result). All SSTable I/O runs
+    /// without any lock so concurrent reads are never blocked by compaction.
+    /// </para>
+    /// <para>
     /// Crash-safe ordering: the manifest is written after the merged file is
-    /// created but before source files are deleted. A crash between those two
-    /// points leaves the manifest in a consistent state; orphaned files are
-    /// cleaned up on the next open.
+    /// fully written and the in-memory state is committed, but before source files
+    /// are deleted. A crash between those steps leaves orphaned source files that
+    /// are removed on the next open.
     /// </para>
     /// </summary>
     private void Compact(List<List<string>> levels, int level)
     {
-        while (levels.Count <= level + 1)
-            levels.Add([]);
+        // ── Phase 1: snapshot sources (brief write lock) ──────────────────────
+        // Take at most _levelSizeLimits[level] files at a time. Batching ensures
+        // that even when many L0 files have accumulated (because the background
+        // thread was behind), each compaction produces exactly one output file
+        // rather than merging everything at once into a single file, allowing
+        // the destination level to accumulate files and cascade naturally.
+        // Source files stay in _levels so concurrent reads continue to find them
+        // while I/O is in progress.
+        List<string> sources;
+        _dbLock.EnterWriteLock();
+        try
+        {
+            while (levels.Count <= level + 1) levels.Add([]);
+            sources = [.. levels[level].Take(_levelSizeLimits[level])];
+        }
+        finally { _dbLock.ExitWriteLock(); }
 
-        var sources = levels[level].ToList();
-        levels[level].Clear();
+        if (sources.Count == 0) return;
 
+        // ── Phase 2: merge I/O (no lock) ─────────────────────────────────────
+        // Source files are immutable so reads can access them concurrently.
+        string outPath = System.IO.Path.Combine(_directory, $"L{level + 1}_{Guid.NewGuid():N}.sst");
         var readers = sources.Select(p => new SSTableReader(p)).ToList();
-        string? outPath = null;
         try
         {
             var merged = MergeEntries(readers, _options.EnableTtl, _filter);
-            outPath = System.IO.Path.Combine(_directory, $"L{level + 1}_{Guid.NewGuid():N}.sst");
             SSTableWriter.Write(outPath, merged, _options.BloomFilterFalsePositiveRate, _options.Compression);
-            levels[level + 1].Add(outPath);
-            _readerCache[outPath] = new SSTableReader(outPath, _blockCache);
-
-            // Write manifest with the new file added and sources removed, BEFORE
-            // deleting the source files. If we crash here the manifest is consistent;
-            // the stale source files become orphans and are removed on next open.
-            _manifest?.Write(levels);
-
-            // Release all file handles on source files before deleting them.
-            foreach (var r in readers) r.Dispose();
-            readers.Clear();
-
-            foreach (var p in sources)
-            {
-                _blockCache?.EvictFile(p);
-                if (_readerCache.TryGetValue(p, out var cached))
-                {
-                    _readerCache.Remove(p);
-                    cached.Dispose();
-                }
-                File.Delete(p);
-            }
         }
         catch
         {
-            // Roll back in-memory state. The outPath file (if created) is an orphan
-            // that will be removed on next open via orphan cleanup.
-            levels[level].AddRange(sources);
-            if (outPath is not null)
-            {
-                levels[level + 1].Remove(outPath);
-                if (_readerCache.TryGetValue(outPath, out var r))
-                {
-                    _readerCache.Remove(outPath);
-                    r.Dispose();
-                }
-            }
+            foreach (var r in readers) r.Dispose();
+            if (File.Exists(outPath)) File.Delete(outPath);
             throw;
         }
         finally
         {
-            foreach (var r in readers) r.Dispose(); // no-op if already disposed above
+            foreach (var r in readers) r.Dispose();
+        }
+
+        // ── Phase 3: commit result (brief write lock) ─────────────────────────
+        // Atomically: add merged file, remove sources, update reader cache.
+        // After this point reads see the merged file and no longer see sources.
+        List<SSTableReader> toDispose = [];
+        _dbLock.EnterWriteLock();
+        try
+        {
+            levels[level + 1].Add(outPath);
+            _readerCache[outPath] = new SSTableReader(outPath, _blockCache);
+
+            foreach (var p in sources)
+            {
+                levels[level].Remove(p);
+                if (_readerCache.TryGetValue(p, out var cached))
+                {
+                    _readerCache.Remove(p);
+                    toDispose.Add(cached); // dispose outside the lock
+                }
+            }
+
+            _manifest?.Write(levels);
+        }
+        catch
+        {
+            // Roll back in-memory state; outPath is an on-disk orphan cleaned up on next open.
+            levels[level + 1].Remove(outPath);
+            if (_readerCache.TryGetValue(outPath, out var r))
+            {
+                _readerCache.Remove(outPath);
+                r.Dispose();
+            }
+            throw;
+        }
+        finally { _dbLock.ExitWriteLock(); }
+
+        // ── Phase 4: cleanup (no lock) ────────────────────────────────────────
+        // All in-flight reads that held references to the old readers have already
+        // released the read lock before phase 3's write lock was granted, so it is
+        // safe to dispose them now.
+        foreach (var r in toDispose) r.Dispose();
+        foreach (var p in sources)
+        {
+            _blockCache?.EvictFile(p);
+            File.Delete(p);
         }
     }
 

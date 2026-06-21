@@ -99,6 +99,11 @@ public class CompactionTests : IDisposable
         using var db = new PithosDb(_dir, Aggressive);
         FillDb(db);
 
+        // Compaction is asynchronous — wait up to 5 s for L0 to drain.
+        SpinWait.SpinUntil(
+            () => Directory.GetFiles(_dir, "L0_*.sst").Length < Aggressive.LevelZeroFileCountLimit,
+            TimeSpan.FromSeconds(5));
+
         var l0Count = Directory.GetFiles(_dir, "L0_*.sst").Length;
         Assert.True(l0Count < Aggressive.LevelZeroFileCountLimit,
             $"Expected L0 file count < {Aggressive.LevelZeroFileCountLimit}, got {l0Count}");
@@ -109,6 +114,12 @@ public class CompactionTests : IDisposable
     {
         using var db = new PithosDb(_dir, Aggressive);
         FillDb(db);
+
+        // Compaction is asynchronous — wait up to 5 s for a higher-level file to appear.
+        SpinWait.SpinUntil(
+            () => Directory.GetFiles(_dir, "*.sst")
+                           .Any(f => !Path.GetFileName(f).StartsWith("L0_", StringComparison.Ordinal)),
+            TimeSpan.FromSeconds(5));
 
         var higherLevel = Directory.GetFiles(_dir, "*.sst")
             .Where(f => !Path.GetFileName(f).StartsWith("L0_", StringComparison.Ordinal))
@@ -140,6 +151,11 @@ public class CompactionTests : IDisposable
         // Writing 1 600 entries (~50 flushes → 25 L0 compactions → 6+ L1 files) forces L1→L2.
         using var db = new PithosDb(_dir, Aggressive);
         FillDb(db, count: 1600);
+
+        // Compaction is asynchronous — wait up to 10 s for cascade to reach L2.
+        SpinWait.SpinUntil(
+            () => Directory.GetFiles(_dir, "L2_*.sst").Length > 0,
+            TimeSpan.FromSeconds(10));
 
         var l2Files = Directory.GetFiles(_dir, "L2_*.sst");
         Assert.NotEmpty(l2Files);

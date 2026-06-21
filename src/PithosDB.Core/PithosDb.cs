@@ -24,6 +24,11 @@ public sealed class PithosDb : IDisposable
     private readonly Manifest _manifest;
     private readonly ReaderWriterLockSlim _lock = new();
 
+    // Background compaction
+    private readonly SemaphoreSlim _compactionSignal = new(0, 1);
+    private readonly CancellationTokenSource _compactionCts = new();
+    private readonly Thread? _compactionThread;
+
     private MemTable _memTable = new();
     private WriteAheadLog? _wal;
 
@@ -49,12 +54,22 @@ public sealed class PithosDb : IDisposable
                 : new LruBlockCache(_options.BlockCacheSizeBytes)
             : null;
         _manifest = new Manifest(directory);
-        _compactor = new LeveledCompactor(directory, _options, _readerCache, _blockCache, _manifest);
+        _compactor = new LeveledCompactor(directory, _options, _readerCache, _blockCache, _manifest, _lock);
         if (!_options.InMemory)
         {
             _wal = new WriteAheadLog(Path.Combine(directory, "wal.log"));
             RecoverFromWal();
             RecoverSSTables();
+
+            _compactionThread = new Thread(CompactionLoop)
+            {
+                IsBackground = true,
+                Name = "PithosDB-Compaction"
+            };
+            _compactionThread.Start();
+
+            // Trigger an initial check in case recovered levels already need compaction.
+            SignalCompaction();
         }
     }
 
@@ -327,7 +342,34 @@ public sealed class PithosDb : IDisposable
         _wal = new WriteAheadLog(Path.Combine(_directory, "wal.log"));
 
         _manifest.Write(_levels);
-        _compactor.CompactIfNeeded(_levels);
+        SignalCompaction();
+    }
+
+    private void SignalCompaction()
+    {
+        // Release at most one token so the background thread wakes up.
+        // SemaphoreFullException means a signal is already pending — that's fine.
+        try { _compactionSignal.Release(); } catch (SemaphoreFullException) { }
+    }
+
+    private void CompactionLoop()
+    {
+        while (true)
+        {
+            try { _compactionSignal.Wait(_compactionCts.Token); }
+            catch (OperationCanceledException) { return; }
+
+            // Drain all pending work before sleeping again. A single
+            // CompactIfNeeded pass may make a previously-under-limit level
+            // go over its limit (L0→L1 can push L1 over its limit), so we
+            // loop until no level needs compaction.
+            try
+            {
+                while (_compactor.CompactIfNeeded(_levels)
+                       && !_compactionCts.IsCancellationRequested) { }
+            }
+            catch { /* exceptions must not kill the compaction thread */ }
+        }
     }
 
     private void RecoverFromWal()
@@ -462,9 +504,21 @@ public sealed class PithosDb : IDisposable
         }
     }
 
-    /// <summary>Flushes and closes the WAL, disposes all cached SSTable readers, then disposes the lock.</summary>
+    /// <summary>
+    /// Stops the background compaction thread, flushes and closes the WAL,
+    /// disposes all cached SSTable readers, then disposes the lock.
+    /// Any compaction already in progress is allowed to finish before returning.
+    /// </summary>
     public void Dispose()
     {
+        // Signal the background thread to stop. If it is mid-compaction it will
+        // finish the current job before seeing the cancellation.
+        _compactionCts.Cancel();
+        SignalCompaction(); // unblock it if it is waiting on the semaphore
+        _compactionThread?.Join();
+        _compactionCts.Dispose();
+        _compactionSignal.Dispose();
+
         _wal?.Dispose();
         foreach (var reader in _readerCache.Values)
             reader.Dispose();
