@@ -403,6 +403,24 @@ public sealed class PithosDb : IDisposable
         return null; // all bytes are 0xFF — no upper bound exists
     }
 
+    /// <summary>
+    /// Returns all live key-value pairs in the inclusive range
+    /// [<paramref name="from"/>, <paramref name="to"/>] in descending key order.
+    /// Omit either bound for an open-ended scan; omit both for a full reverse scan.
+    /// Expired and filtered entries are excluded.
+    /// </summary>
+    public IEnumerable<(byte[] key, byte[] value)> ScanDescending(byte[]? from = null, byte[]? to = null)
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            var results = CollectScan(from, to);
+            results.Reverse();
+            return results;
+        }
+        finally { _lock.ExitReadLock(); }
+    }
+
     // Strips the TTL header (when EnableTtl), checks expiry, and applies the
     // compaction filter. Returns false if the entry should be hidden from the caller.
     private bool DecodeAndFilter(byte[] key, byte[] raw, out byte[]? value)
@@ -683,6 +701,25 @@ public sealed class PithosDb : IDisposable
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var results = await Task.Run(() => ScanPrefix(prefix).ToList(), cancellationToken)
+                                .ConfigureAwait(false);
+        foreach (var entry in results)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return entry;
+        }
+    }
+
+    /// <summary>
+    /// Asynchronously streams all live key-value pairs in the inclusive range
+    /// [<paramref name="from"/>, <paramref name="to"/>] in descending key order.
+    /// Omit either bound for an open-ended scan; omit both for a full reverse scan.
+    /// </summary>
+    public async IAsyncEnumerable<(byte[] key, byte[] value)> ScanDescendingAsync(
+        byte[]? from = null,
+        byte[]? to = null,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var results = await Task.Run(() => ScanDescending(from, to).ToList(), cancellationToken)
                                 .ConfigureAwait(false);
         foreach (var entry in results)
         {
