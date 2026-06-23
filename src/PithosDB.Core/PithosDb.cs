@@ -126,38 +126,40 @@ public sealed class PithosDb : IDisposable
     public void Write(WriteBatch batch)
     {
         if (batch.Operations.Count == 0) return;
-
         _lock.EnterWriteLock();
-        try
-        {
-            // Encode put values at the point of entry so WAL and MemTable store the
-            // same format as individual Put calls.
-            var encoded = batch.Operations
-                .Select(op =>
-                {
-                    if (op.Type != WalEntryType.Put) return (op.Type, op.Key, op.Value);
-                    if (op.Ttl.HasValue)
-                    {
-                        if (!_options.EnableTtl)
-                            throw new InvalidOperationException(
-                                "TTL batch entries require PithosOptions.EnableTtl = true.");
-                        return (op.Type, op.Key,
-                            (byte[]?)ValueCodec.EncodeWithExpiry(op.Value!, DateTimeOffset.UtcNow.Add(op.Ttl.Value)));
-                    }
-                    return (op.Type, op.Key,
-                        (byte[]?)(_options.EnableTtl ? ValueCodec.Encode(op.Value!) : op.Value));
-                })
-                .ToList();
-
-            _wal?.AppendBatch(encoded);
-            foreach (var (type, key, value) in encoded)
-            {
-                if (type == WalEntryType.Put) _memTable.Put(key, value!);
-                else _memTable.Delete(key);
-            }
-            MaybeFlushMemTable();
-        }
+        try { ApplyBatch(batch); }
         finally { _lock.ExitWriteLock(); }
+    }
+
+    // Encodes, WAL-appends, and MemTable-applies a batch. Caller must hold the write lock.
+    private void ApplyBatch(WriteBatch batch)
+    {
+        if (batch.Operations.Count == 0) return;
+
+        var encoded = batch.Operations
+            .Select(op =>
+            {
+                if (op.Type != WalEntryType.Put) return (op.Type, op.Key, op.Value);
+                if (op.Ttl.HasValue)
+                {
+                    if (!_options.EnableTtl)
+                        throw new InvalidOperationException(
+                            "TTL batch entries require PithosOptions.EnableTtl = true.");
+                    return (op.Type, op.Key,
+                        (byte[]?)ValueCodec.EncodeWithExpiry(op.Value!, DateTimeOffset.UtcNow.Add(op.Ttl.Value)));
+                }
+                return (op.Type, op.Key,
+                    (byte[]?)(_options.EnableTtl ? ValueCodec.Encode(op.Value!) : op.Value));
+            })
+            .ToList();
+
+        _wal?.AppendBatch(encoded);
+        foreach (var (type, key, value) in encoded)
+        {
+            if (type == WalEntryType.Put) _memTable.Put(key, value!);
+            else _memTable.Delete(key);
+        }
+        MaybeFlushMemTable();
     }
 
     /// <summary>
@@ -612,6 +614,38 @@ public sealed class PithosDb : IDisposable
             if (_levels.Count > 0)
                 _manifest.Write(_levels);
         }
+    }
+
+    // ── Transactions ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Begins a new optimistic <see cref="Transaction"/>. A point-in-time
+    /// <see cref="Snapshot"/> is taken at this moment to provide consistent reads
+    /// throughout the transaction's lifetime. Dispose or <see cref="Transaction.Rollback"/>
+    /// the returned transaction if it is not committed.
+    /// </summary>
+    public Transaction BeginTransaction() => new Transaction(this, GetSnapshot());
+
+    // Validates the read set and applies the write batch atomically under the write lock.
+    // Returns false (without applying any writes) if a conflict is detected.
+    internal bool TryCommitTransaction(
+        Snapshot snapshot,
+        IReadOnlyCollection<byte[]> readKeys,
+        WriteBatch batch)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            foreach (var key in readKeys)
+            {
+                var current = ReadCurrentValue(key);
+                snapshot.TryGet(key, out var snapVal);
+                if (!BytesEqual(current, snapVal)) return false;
+            }
+            ApplyBatch(batch);
+            return true;
+        }
+        finally { _lock.ExitWriteLock(); }
     }
 
     // ── Snapshot ──────────────────────────────────────────────────────────────
