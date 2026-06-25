@@ -616,6 +616,55 @@ public sealed class PithosDb : IDisposable
         }
     }
 
+    // ── Stats ─────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Returns a point-in-time <see cref="DbStats"/> snapshot: MemTable usage,
+    /// per-level SSTable file counts and on-disk sizes, block cache occupancy,
+    /// and WAL size. Acquiring the read lock ensures a consistent view; the call
+    /// is fast for typical level counts but does perform one
+    /// <see cref="FileInfo"/> lookup per SSTable file.
+    /// </summary>
+    public DbStats GetStats()
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            var fileCounts = _levels.Select(l => l.Count).ToList();
+            var diskSizes  = _levels
+                .Select(l => l.Sum(p => File.Exists(p) ? new FileInfo(p).Length : 0L))
+                .ToList();
+
+            long walSize = -1;
+            if (!_options.InMemory)
+            {
+                var walPath = Path.Combine(_directory, "wal.log");
+                walSize = File.Exists(walPath) ? new FileInfo(walPath).Length : 0L;
+            }
+
+            return new DbStats
+            {
+                MemTableSizeBytes        = _memTable.SizeBytes,
+                MemTableEntryCount       = _memTable.Count,
+                LevelCount               = _levels.Count,
+                FileCountPerLevel        = fileCounts,
+                DiskSizeBytesPerLevel    = diskSizes,
+                TotalSstFileCount        = fileCounts.Sum(),
+                TotalSstDiskSizeBytes    = diskSizes.Sum(),
+                BlockCacheCurrentSizeBytes = _blockCache?.CurrentSizeBytes ?? -1L,
+                BlockCacheMaxSizeBytes     = _blockCache is not null ? _options.BlockCacheSizeBytes : -1L,
+                WalSizeBytes             = walSize,
+            };
+        }
+        finally { _lock.ExitReadLock(); }
+    }
+
+    /// <summary>
+    /// Asynchronously returns a <see cref="DbStats"/> snapshot.
+    /// </summary>
+    public Task<DbStats> GetStatsAsync(CancellationToken cancellationToken = default)
+        => Task.Run(GetStats, cancellationToken);
+
     // ── Transactions ──────────────────────────────────────────────────────────
 
     /// <summary>

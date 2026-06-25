@@ -25,4 +25,7 @@ public interface IBlockCache
     /// before deleting the underlying SSTable file during compaction.
     /// </summary>
     void EvictFile(string path);
+
+    /// <summary>Current number of bytes stored in the cache.</summary>
+    long CurrentSizeBytes { get; }
 }

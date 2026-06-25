@@ -16,6 +16,9 @@ public class MemTable
     /// <summary>Approximate in-memory size of all keys and values in bytes.</summary>
     public long SizeBytes => _sizeBytes;
 
+    /// <summary>Number of entries including tombstones.</summary>
+    public int Count => _data.Count;
+
     /// <summary>
     /// Inserts or updates <paramref name="key"/> with <paramref name="value"/>.
     /// <see cref="SizeBytes"/> is adjusted to reflect the new entry size.

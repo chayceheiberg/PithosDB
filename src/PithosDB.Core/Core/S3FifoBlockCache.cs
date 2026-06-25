@@ -104,6 +104,9 @@ public sealed class S3FifoBlockCache : IBlockCache
         }
     }
 
+    /// <inheritdoc/>
+    public long CurrentSizeBytes { get { lock (_sync) return _smallUsed + _mainUsed; } }
+
     // ── Private helpers ────────────────────────────────────────────────────
 
     private void InsertIntoSmall((string, long) key, byte[] data)

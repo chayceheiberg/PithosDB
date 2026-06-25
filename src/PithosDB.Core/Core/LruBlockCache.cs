@@ -74,6 +74,9 @@ public sealed class LruBlockCache : IBlockCache
         }
     }
 
+    /// <inheritdoc/>
+    public long CurrentSizeBytes { get { lock (_sync) return _usedBytes; } }
+
     private void Remove(LinkedListNode<Entry> node)
     {
         _map.Remove((node.Value.Path, node.Value.Offset));
